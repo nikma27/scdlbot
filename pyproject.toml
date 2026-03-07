@@ -28,7 +28,9 @@ classifiers = [
   "Natural Language :: English",
 ]
 
-include = ["AUTHORS.rst", "CONTRIBUTING.md", "CHANGELOG.rst", "LICENSE", "README.rst", "tests/*", "docs/*.rst", "docs/conf.py", "docs/Makefile", "docs/*.jpg", "docs/*.png", "docs/*.gif", "scdlbot/texts/*"]
+include = ["AUTHORS.rst", "CONTRIBUTING.md", "CHANGELOG.rst", "LICENSE", "README.rst", "tests/*", "docs/*.rst", "docs/conf.py", "docs/Makefile", "docs/*.jpg", "docs/*.png", "docs/*.gif", "scdlbot/texts/*", "flacbot/texts/*"]
+
+packages = [{include = "scdlbot"}, {include = "flacbot"}]
 
 [tool.poetry.urls]
 # https://github.com/python-poetry/poetry/blob/master/docs/pyproject.md#urls
@@ -39,6 +41,7 @@ include = ["AUTHORS.rst", "CONTRIBUTING.md", "CHANGELOG.rst", "LICENSE", "README
 
 [tool.poetry.scripts]
 scdlbot = "scdlbot.__main__:main"
+flacbot = "flacbot.__main__:main"
 
 [tool.poetry.dependencies]
 # https://endoflife.date/python
@@ -106,6 +109,13 @@ safety = "^3.7.0"
 [tool.poetry.group.docs]
 optional = true
 
+[tool.poetry.group.flacbot]
+optional = true
+
+[tool.poetry.group.flacbot.dependencies]
+spotipy = "^2.23.0"
+musicbrainzngs = "^0.7.1"
+
 [tool.poetry.group.docs.dependencies]
 sphinx = "^8.2.3"
 sphinx-autodoc-typehints = "^3.5.2"
@@ -117,7 +127,6 @@ myst-parser = "^5.0.0"
 tomli = "^2.4.0"
 recommonmark = "^0.7.1"
 typing-extensions = "^4.15.0"
-
 
 [tool.isort]
 # isort configuration:
