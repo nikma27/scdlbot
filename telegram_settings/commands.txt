@@ -1,4 +1,5 @@
 dl - + <links> required! download now
 link - + <links> required! get direct url
+search - search audio/video on VK
 settings - change default mode and spam
 help - show the help message
