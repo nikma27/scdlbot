@@ -7,15 +7,17 @@ _Send or forward_ a text message containing links and I will:
 • In *Ask* mode: scan for supported links and ask you to choose what to do with them: download or get links
 • Use /settings to select working mode for messages sent *without direct command* (simple messages with links).
 • Use /settings to toggle *Captions*.
+• Use `/search <query>` to search audio/video on *VK*.
 • [Privacy mode](https://core.telegram.org/bots/features#privacy-mode) is _disabled_, so that I scan every group message.
 • Supported links and streaming websites:
 - *SoundCloud*: tracks/playlists/pages with private widgets
 - *Bandcamp*: tracks/albums/custom links
 - *YouTube*: videos/playlists/_not_ lives
-- *Mixcloud, Vimeo and* [pretty much everything from this list](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) if you enable *Unknown sites*, but no VK Music
+- *VK*: audio/video
+- *Mixcloud, Vimeo and* [pretty much everything from this list](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) if you enable *Unknown sites*
 
 *Example message with links:*
-`Hey, check this out! https://m.soundcloud.com/falling-ethics/jk-flesh-static-demon-fexelvn004 and also https://shitmat.bandcamp.com/track/amen-babylon-2016-mix and youtu.be/Mdzy5RKn434`
+`Hey, check this out! https://m.soundcloud.com/falling-ethics/jk-flesh-static-demon-fexelvn004 and also https://shitmat.bandcamp.com/track/amen-babylon-2016-mix and youtu.be/Mdzy5RKn434 and https://vk.com/audio123456_789`
 
 👨🏻‍💻 *Developed by @gpchelkin*:
 [🐝 Channel](https://t.me/ggpchelkin/150) | [🐝 Homepage](https://g.pchelk.in)

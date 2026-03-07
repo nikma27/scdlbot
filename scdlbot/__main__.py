@@ -20,7 +20,7 @@ from importlib import resources
 from logging.handlers import SysLogHandler
 from multiprocessing import get_context
 from subprocess import PIPE, TimeoutExpired  # skipcq: BAN-B404
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from uuid import uuid4
 
 import ffmpeg
@@ -249,7 +249,9 @@ DOMAIN_TT = "tiktok.com"
 DOMAIN_IG = "instagram.com"
 DOMAIN_TW = "twitter.com"
 DOMAIN_TWX = "x.com"
-DOMAINS_STRINGS = [DOMAIN_SC, DOMAIN_SC_ON, DOMAIN_SC_API, DOMAIN_SC_GOOGL, DOMAIN_BC, DOMAIN_YT, DOMAIN_YT_BE, DOMAIN_YMR, DOMAIN_YMC, DOMAIN_TT, DOMAIN_IG, DOMAIN_TW, DOMAIN_TWX]
+DOMAIN_VK = "vk.com"
+DOMAIN_VK_RU = "vk.ru"
+DOMAINS_STRINGS = [DOMAIN_SC, DOMAIN_SC_ON, DOMAIN_SC_API, DOMAIN_SC_GOOGL, DOMAIN_BC, DOMAIN_YT, DOMAIN_YT_BE, DOMAIN_YMR, DOMAIN_YMC, DOMAIN_TT, DOMAIN_IG, DOMAIN_TW, DOMAIN_TWX, DOMAIN_VK, DOMAIN_VK_RU]
 DOMAINS = [rf"^(?:[^\s]+\.)?{re.escape(domain_string)}$" for domain_string in DOMAINS_STRINGS]
 
 AUDIO_FORMATS = ["mp3"]
@@ -385,6 +387,31 @@ async def settings_command_callback(update: Update, context: ContextTypes.DEFAUL
         flood=(chat_id not in NO_FLOOD_CHAT_IDS),
     )
     await context.bot.send_message(chat_id=chat_id, parse_mode="Markdown", reply_markup=get_settings_inline_keyboard(context.chat_data), text=SETTINGS_TEXT)
+
+
+async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search on vk.com - returns links to VK audio and video search."""
+    command_name = "search"
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    if not chat_allowed(chat_id):
+        await context.bot.send_message(chat_id=chat_id, text="This command isn't allowed in this chat.")
+        return
+    if not context.args:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Usage: `/search <query>`\n\nExample: `/search Pink Floyd`",
+            parse_mode="Markdown",
+        )
+        return
+    logger.debug(command_name)
+    BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
+    query = " ".join(context.args)
+    query_encoded = quote(query, safe="")
+    audio_url = f"https://vk.com/audio?q={query_encoded}"
+    video_url = f"https://vk.com/video?q={query_encoded}"
+    text = f"🔍 *VK Search* for _{escape_markdown(query, version=1)}_\n\n• [Audio]({audio_url})\n• [Video]({video_url})\n\n_Send me a direct link to download_"
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
 
 
 async def dl_link_commands_and_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -796,6 +823,9 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
         elif (DOMAIN_TW in url.host or DOMAIN_TWX in url.host) and (DOMAIN_YMC not in url.host) and (3 <= url_parts_num <= 3):
             # Twitter: videos
             # We know for sure these links can be downloaded, so we just skip running ydl_get_direct_urls
+            urls_dict[url_text] = "http"
+        elif DOMAIN_VK in url.host or DOMAIN_VK_RU in url.host:
+            # VK: audio, video
             urls_dict[url_text] = "http"
     return urls_dict
 
@@ -1280,6 +1310,8 @@ def download_url_and_send(
                         source = "SoundCloud"
                     elif DOMAIN_BC in host:
                         source = "Bandcamp"
+                    elif DOMAIN_VK in host or DOMAIN_VK_RU in host:
+                        source = "VK"
                     else:
                         source = url_obj.host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "")
                     # TODO fix youtube id in [] ?
@@ -1493,6 +1525,7 @@ def main():
     start_command_handler = CommandHandler("start", start_help_commands_callback)
     help_command_handler = CommandHandler("help", start_help_commands_callback)
     settings_command_handler = CommandHandler("settings", settings_command_callback)
+    search_command_handler = CommandHandler("search", search_command_callback)
     dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED)
     link_command_handler = CommandHandler("link", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED)
     message_with_links_handler = MessageHandler(
@@ -1512,6 +1545,7 @@ def main():
     application.add_handler(start_command_handler)
     application.add_handler(help_command_handler)
     application.add_handler(settings_command_handler)
+    application.add_handler(search_command_handler)
     application.add_handler(dl_command_handler)
     application.add_handler(link_command_handler)
     application.add_handler(message_with_links_handler)
