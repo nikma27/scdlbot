@@ -33,7 +33,7 @@ import sdnotify
 from fake_useragent import UserAgent
 from mutagen.id3 import ID3, ID3v1SaveOptions
 from mutagen.mp3 import EasyMP3 as MP3
-from pebble import ProcessPool
+from pebble import ProcessPool, ThreadPool
 from telegram import Bot, Chat, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction
 
@@ -106,9 +106,13 @@ if platform.system() == "Windows":
 # https://superfastpython.com/processpoolexecutor-multiprocessing-context/
 # https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods
 # https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor
+EXECUTOR_KIND = os.getenv("EXECUTOR_KIND", "thread").lower()
 # EXECUTOR = concurrent.futures.ProcessPoolExecutor(max_workers=WORKERS, mp_context=get_context(method=mp_method))
-# NOTE: avoid initializer from __main__ to keep forkserver workers picklable in cloud runtime.
-EXECUTOR = ProcessPool(max_workers=WORKERS, max_tasks=20, context=get_context(method=mp_method))
+if EXECUTOR_KIND == "process":
+    EXECUTOR = ProcessPool(max_workers=WORKERS, max_tasks=20, context=get_context(method=mp_method))
+else:
+    # ThreadPool avoids pickling issues for runtime-defined callables in cloud runs.
+    EXECUTOR = ThreadPool(max_workers=WORKERS, max_tasks=20)
 DL_TIMEOUT = int(os.getenv("DL_TIMEOUT", 300))
 CHECK_URL_TIMEOUT = int(os.getenv("CHECK_URL_TIMEOUT", 30))
 # Timeouts: https://www.python-httpx.org/advanced/
@@ -521,7 +525,7 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         "source_ip": source_ip,
         "proxy": proxy,
     }
-    EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
+    schedule_download_task(kwargs)
 
 
 async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -688,7 +692,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
                     # EXECUTOR.submit(download_url_and_send, **kwargs)
-                    EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
+                    schedule_download_task(kwargs)
 
     elif action == "link":
         if "http" not in urls_values:
@@ -792,7 +796,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                 # Run heavy task in separate process, "fire and forget":
                 # EXECUTOR.submit(download_url_and_send, **kwargs)
-                EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
+                schedule_download_task(kwargs)
 
         elif button_action == "link":
             await context.bot.send_message(chat_id=chat_id, reply_to_message_id=url_message_id, parse_mode="Markdown", disable_web_page_preview=True, text=get_link_text(urls_dict))
@@ -1111,6 +1115,13 @@ def ydl_download_audio_fallback(url, download_dir, source_ip=None, proxy=None):
         logger.debug("ydl fallback download failed: %s", url)
         logger.debug(traceback.format_exc())
         return False
+
+
+def schedule_download_task(kwargs):
+    """Schedule a download task on the configured executor backend."""
+    if EXECUTOR_KIND == "process":
+        return EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
+    return EXECUTOR.schedule(download_url_and_send, kwargs=kwargs)
 
 
 def download_url_and_send(
