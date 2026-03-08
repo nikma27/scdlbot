@@ -12,6 +12,7 @@ import random
 import re
 import resource
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -34,7 +35,7 @@ from fake_useragent import UserAgent
 from mutagen.id3 import ID3, ID3v1SaveOptions
 from mutagen.mp3 import EasyMP3 as MP3
 from pebble import ProcessPool, ThreadPool
-from telegram import Bot, Chat, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
+from telegram import Bot, BotCommand, Chat, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 
 # from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, TelegramError, TimedOut
@@ -388,6 +389,22 @@ def get_settings_inline_keyboard(chat_data):
     return inline_keyboard
 
 
+def get_command_reply_keyboard(include_restart=False):
+    rows = [
+        [KeyboardButton("/help"), KeyboardButton("/settings")],
+        [KeyboardButton("/search"), KeyboardButton("/dl")],
+    ]
+    if include_restart:
+        rows.append([KeyboardButton("/restart")])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        selective=True,
+        input_field_placeholder="Выберите команду или отправьте ссылку/текст",
+    )
+
+
 def chat_allowed(chat_id):
     if WHITELIST_CHATS:
         if chat_id not in WHITELIST_CHATS:
@@ -440,11 +457,13 @@ async def start_help_commands_callback(update: Update, context: ContextTypes.DEF
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     if command_name == "start":
         # Keep /start lightweight and plain text for maximum delivery reliability.
+        include_restart = bool(update.effective_user and update.effective_user.id == TG_BOT_OWNER_CHAT_ID)
         await context.bot.send_message(
             chat_id=chat_id,
             reply_to_message_id=message.message_id,
             text=f"{START_TEXT}\n\nНужна подробная инструкция: /help",
             disable_web_page_preview=True,
+            reply_markup=get_command_reply_keyboard(include_restart=include_restart),
         )
         return
     try:
@@ -477,6 +496,31 @@ async def settings_command_callback(update: Update, context: ContextTypes.DEFAUL
         flood=(chat_id not in NO_FLOOD_CHAT_IDS),
     )
     await context.bot.send_message(chat_id=chat_id, parse_mode="Markdown", reply_markup=get_settings_inline_keyboard(context.chat_data), text=SETTINGS_TEXT)
+
+
+async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command_name = "restart"
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else 0
+    logger.info("received command: %s chat_id=%s user_id=%s", command_name, chat_id, user_id)
+    BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
+    if user_id != TG_BOT_OWNER_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id if message else None,
+            text=NOT_ADMIN_TEXT,
+            parse_mode="Markdown",
+        )
+        return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        reply_to_message_id=message.message_id if message else None,
+        text="Перезапускаю бота...",
+    )
+    await asyncio.sleep(0.2)
+    os.execv(sys.executable, [sys.executable, "-m", "scdlbot"])
 
 
 def search_high_quality_sources(query, source_ip=None, proxy=None):
@@ -1948,6 +1992,19 @@ async def post_shutdown(application: Application) -> None:
 async def post_init(application: Application) -> None:
     SYSTEMD_NOTIFIER.notify("READY=1")
     SYSTEMD_NOTIFIER.notify(f"STATUS=Application initialized")
+    commands = [
+        BotCommand("start", "Запуск и кнопки команд"),
+        BotCommand("help", "Справка"),
+        BotCommand("settings", "Настройки"),
+        BotCommand("search", "Поиск трека"),
+        BotCommand("dl", "Скачать по ссылке"),
+        BotCommand("link", "Показать прямые ссылки"),
+        BotCommand("restart", "Перезапуск (владелец)"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+    except Exception:
+        logger.warning("Could not set bot command menu", exc_info=True)
 
 
 async def callback_watchdog(context: ContextTypes.DEFAULT_TYPE):
@@ -2030,6 +2087,7 @@ def main():
     start_command_handler = CommandHandler("start", start_help_commands_callback, block=False)
     help_command_handler = CommandHandler("help", start_help_commands_callback, block=False)
     settings_command_handler = CommandHandler("settings", settings_command_callback, block=False)
+    restart_command_handler = CommandHandler("restart", restart_command_callback, block=False)
     search_command_handler = CommandHandler("search", search_command_callback, block=False)
     dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED, block=False)
     link_command_handler = CommandHandler("link", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED, block=False)
@@ -2060,6 +2118,7 @@ def main():
     application.add_handler(start_command_handler)
     application.add_handler(help_command_handler)
     application.add_handler(settings_command_handler)
+    application.add_handler(restart_command_handler)
     application.add_handler(search_command_handler)
     application.add_handler(dl_command_handler)
     application.add_handler(link_command_handler)
