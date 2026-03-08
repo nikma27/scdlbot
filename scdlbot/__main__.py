@@ -1520,7 +1520,12 @@ def main():
         .build()
     )
 
-    bot_username = requests.get(f"{TG_BOT_API}/bot{TG_BOT_TOKEN}/getMe").json()["result"]["username"]
+    get_me_response = requests.get(f"{TG_BOT_API}/bot{TG_BOT_TOKEN}/getMe", timeout=COMMON_CONNECTION_TIMEOUT)
+    get_me_data = get_me_response.json()
+    if not get_me_data.get("ok") or "result" not in get_me_data:
+        error_details = get_me_data.get("description", "unknown error")
+        raise RuntimeError(f"Failed to fetch bot profile from Telegram API: {error_details}")
+    bot_username = get_me_data["result"]["username"]
     blacklist_whitelist_handler = MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, blacklist_whitelist_callback)
     start_command_handler = CommandHandler("start", start_help_commands_callback)
     help_command_handler = CommandHandler("help", start_help_commands_callback)
