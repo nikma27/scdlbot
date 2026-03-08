@@ -63,6 +63,7 @@ from scdlbot.quality_fallback import (
     build_query_from_local_tags,
     compute_title_match_ratio,
     discover_platform_candidates,
+    discover_youtube_candidates,
     discover_web_candidates,
     find_better_source,
     inspect_local_audio_quality,
@@ -321,6 +322,12 @@ QUERY_STOPWORDS = {
 VK_AUDIO_ID_PATH_RE = re.compile(r"^audio\d+_\d+_[0-9a-f]+$", re.IGNORECASE)
 LOSSLESS_AUDIO_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
 SEARCH_CHOICE_CACHE_PREFIX = "search_choice:"
+BTN_HELP = "❓ Помощь"
+BTN_SETTINGS = "⚙️ Настройки"
+BTN_SEARCH = "🔎 Поиск"
+BTN_DL = "⬇️ Скачать по ссылке"
+BTN_LINK = "🔗 Показать ссылки"
+BTN_RESTART = "🔄 Перезапуск бота"
 
 
 # TODO get rid of these dumb exceptions:
@@ -395,12 +402,12 @@ def get_settings_inline_keyboard(chat_data):
 
 def get_command_reply_keyboard(include_restart=False):
     rows = [
-        [KeyboardButton("/help"), KeyboardButton("/settings")],
-        [KeyboardButton("/search"), KeyboardButton("/dl")],
-        [KeyboardButton("/link")],
+        [KeyboardButton(BTN_HELP), KeyboardButton(BTN_SETTINGS)],
+        [KeyboardButton(BTN_SEARCH), KeyboardButton(BTN_DL)],
+        [KeyboardButton(BTN_LINK)],
     ]
     if include_restart:
-        rows.append([KeyboardButton("/restart")])
+        rows.append([KeyboardButton(BTN_RESTART)])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
@@ -532,10 +539,13 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
     """Search candidate links and rank by available audio quality."""
     query_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", query.lower()))
     query_tokens = {x for x in query_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as discover_pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as discover_pool:
+        youtube_future = discover_pool.submit(discover_youtube_candidates, query, ydl, FALLBACK_MAX_CANDIDATES)
         platform_future = discover_pool.submit(discover_platform_candidates, query, ydl, FALLBACK_MAX_CANDIDATES, prefer_youtube=True)
         web_future = discover_pool.submit(discover_web_candidates, query, FALLBACK_MAX_CANDIDATES) if ENABLE_WEB_FALLBACK else None
-        candidates = platform_future.result()
+        youtube_candidates = youtube_future.result()
+        platform_candidates = platform_future.result()
+        candidates = youtube_candidates + platform_candidates
         if web_future:
             candidates.extend(web_future.result())
     seen = set()
@@ -696,13 +706,13 @@ def format_quality_label(quality):
 def get_source_name(host: str) -> str:
     host = (host or "").lower()
     if DOMAIN_YT in host or DOMAIN_YT_BE in host:
-        return "YouTube"
+        return "Ютуб"
     if DOMAIN_SC in host or DOMAIN_SC_GOOGL in host:
-        return "SoundCloud"
+        return "Саундклауд"
     if DOMAIN_BC in host:
-        return "Bandcamp"
+        return "Бэндкэмп"
     if DOMAIN_VK in host or DOMAIN_VK_RU in host:
-        return "VK"
+        return "ВК"
     if DOMAIN_TEXAMP in host:
         return "Texamp"
     return host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "") or "Источник"
@@ -796,6 +806,52 @@ def build_track_caption(file_path: str, host: str) -> str:
     if len(caption) > 1020:
         caption = caption[:1017] + "..."
     return caption
+
+
+async def handle_quick_button_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Handle Russian quick-action buttons from reply keyboard."""
+    chat_id = update.effective_chat.id
+    message = update.effective_message
+    if text == BTN_HELP:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text=HELP_TEXT,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return True
+    if text == BTN_SETTINGS:
+        await settings_command_callback(update, context)
+        return True
+    if text == BTN_SEARCH:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text="Введите запрос текстом (например: `Daft Punk One More Time`) или используйте `/search исполнитель трек`.",
+            parse_mode="Markdown",
+        )
+        return True
+    if text == BTN_DL:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text="Отправьте ссылку одним сообщением или используйте `/dl <ссылка>`.",
+            parse_mode="Markdown",
+        )
+        return True
+    if text == BTN_LINK:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text="Отправьте ссылку и нажмите режим ссылок, или используйте `/link <ссылка>`.",
+            parse_mode="Markdown",
+        )
+        return True
+    if text == BTN_RESTART:
+        await restart_command_callback(update, context)
+        return True
+    return False
 
 
 async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, command_name: str):
@@ -910,6 +966,9 @@ async def search_query_message_callback(update: Update, context: ContextTypes.DE
     """Treat plain text messages as search queries in unified mode."""
     message = update.effective_message
     if not message or not getattr(message, "text", None):
+        return
+    text = (message.text or "").strip()
+    if await handle_quick_button_message(update, context, text):
         return
     query = build_query_from_message_text(message.text)
     if not is_usable_query(query):
@@ -1088,7 +1147,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
             question = "🎶 Ссылки найдены. Что делаем?"
             button_dl = InlineKeyboardButton(text="⬇️ Скачать", callback_data=" ".join([url_message_id, "dl"]))
             button_link = InlineKeyboardButton(text="🔗️ Показать ссылки", callback_data=" ".join([url_message_id, "link"]))
-            button_cancel = InlineKeyboardButton(text="❌", callback_data=" ".join([url_message_id, "cancel"]))
+            button_cancel = InlineKeyboardButton(text="❌ Отмена", callback_data=" ".join([url_message_id, "cancel"]))
             inline_keyboard = InlineKeyboardMarkup([[button_dl, button_link, button_cancel]])
             await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, reply_markup=inline_keyboard, text=question)
 

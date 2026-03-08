@@ -16,6 +16,7 @@ from mutagen import File as MutagenFile
 LOSSLESS_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
 DEFAULT_SEARCH_PREFIXES = ("ytsearch10", "scsearch5")
 YOUTUBE_FOCUSED_SEARCH_PREFIXES = ("ytsearch20", "ytsearch10", "scsearch5")
+YOUTUBE_ONLY_SEARCH_PREFIXES = ("ytsearch25", "ytsearch10")
 
 
 class _YdlSilentLogger:
@@ -155,7 +156,10 @@ def find_better_source(
     if not query:
         return None
 
-    candidates = discover_platform_candidates(query, ydl_module, max_candidates, prefer_youtube=prefer_youtube)
+    candidates: list[str] = []
+    if prefer_youtube:
+        candidates.extend(discover_youtube_candidates(query, ydl_module, max_candidates))
+    candidates.extend(discover_platform_candidates(query, ydl_module, max_candidates, prefer_youtube=prefer_youtube))
     if web_fallback:
         candidates.extend(discover_web_candidates(query, max_candidates))
 
@@ -231,6 +235,32 @@ def discover_platform_candidates(query: str, ydl_module: Any, max_candidates: in
             seen.add(candidate)
             results.append(candidate)
             if len(results) >= target_limit:
+                return results
+    return results
+
+
+def discover_youtube_candidates(query: str, ydl_module: Any, max_candidates: int) -> list[str]:
+    """Use yt-dlp YouTube search method directly and return normalized URLs."""
+    results: list[str] = []
+    seen: set[str] = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(YOUTUBE_ONLY_SEARCH_PREFIXES))) as pool:
+        future_map = {pool.submit(_search_prefix_candidates, prefix, query, ydl_module): prefix for prefix in YOUTUBE_ONLY_SEARCH_PREFIXES}
+        by_prefix: dict[str, list[str]] = {}
+        for future in concurrent.futures.as_completed(future_map):
+            prefix = future_map[future]
+            try:
+                by_prefix[prefix] = future.result()
+            except Exception:
+                by_prefix[prefix] = []
+    for prefix in YOUTUBE_ONLY_SEARCH_PREFIXES:
+        for candidate in by_prefix.get(prefix, []):
+            if candidate in seen:
+                continue
+            if not _is_youtube_url(candidate):
+                continue
+            seen.add(candidate)
+            results.append(candidate)
+            if len(results) >= max_candidates:
                 return results
     return results
 
