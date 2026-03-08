@@ -34,6 +34,7 @@ Run all commands from repository root (`/workspace` in Cursor Cloud).
 
 - Keep major dependency upgrades (`scdl`, `doc8`) in separate PRs and validate bot behavior before rollout.
 - Keep `.env.cloud` out of git; commit only `.env.cloud.sample`.
+- Detailed runtime workflow for search/download: `SEARCH_WORKFLOW.md`.
 - Quality fallback controls for `scdlbot`:
   - `QUALITY_MIN_BITRATE_KBPS` (default `320`)
   - `PREFER_LOSSLESS` (`1` means try to upgrade lossy tracks)
