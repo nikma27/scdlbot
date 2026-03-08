@@ -20,7 +20,7 @@ from importlib import resources
 from logging.handlers import SysLogHandler
 from multiprocessing import get_context
 from subprocess import PIPE, TimeoutExpired  # skipcq: BAN-B404
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from uuid import uuid4
 
 import ffmpeg
@@ -443,6 +443,12 @@ def build_query_from_message_text(message_text):
     url_text = url_match.group(0).rstrip(").,!?")
     try:
         url = URL(url_text)
+        parsed_qs = parse_qs(urlparse(url_text).query)
+        for key in ("q", "query", "text", "title"):
+            if key in parsed_qs and parsed_qs[key]:
+                candidate = re.sub(r"\s+", " ", unquote(parsed_qs[key][0])).strip()
+                if len(candidate) > 2:
+                    return candidate
         words = []
         for part in url.path_parts:
             if not part:
@@ -524,6 +530,7 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         "cookies_file": COOKIES_FILE,
         "source_ip": source_ip,
         "proxy": proxy,
+        "query_hint": query,
     }
     schedule_download_task(kwargs)
 
@@ -604,6 +611,8 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     if PROXIES:
         proxy = random.choice(PROXIES)
     wait_message_id = None
+    message_text = (message.text or message.caption or "").strip()
+    query_hint = build_query_from_message_text(message_text)
     if action in ["dl", "link"]:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         wait_message = await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, parse_mode="Markdown", text=f"_{get_random_wait_text()}_")
@@ -688,6 +697,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                         "cookies_file": COOKIES_FILE,
                         "source_ip": source_ip,
                         "proxy": proxy,
+                        "query_hint": query_hint,
                     }
                     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
@@ -792,6 +802,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     "cookies_file": COOKIES_FILE,
                     "source_ip": url_message_data["source_ip"],
                     "proxy": url_message_data["proxy"],
+                    "query_hint": None,
                 }
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                 # Run heavy task in separate process, "fire and forget":
@@ -1134,6 +1145,7 @@ def download_url_and_send(
     cookies_file=None,
     source_ip=None,
     proxy=None,
+    query_hint=None,
 ):
     logger.debug("Entering: download_url_and_send")
     # loop_main = asyncio.get_event_loop()
@@ -1378,6 +1390,37 @@ def download_url_and_send(
             cookies_download_file.close()
             os.unlink(cookies_download_file.name)
         # gc.collect()
+
+    if status == "failed" and ENABLE_CROSS_PLATFORM_SEARCH and not download_video:
+        fallback_query = query_hint or build_query_from_message_text(url)
+        if fallback_query:
+            better_source = find_better_source(
+                query=fallback_query,
+                current_quality=None,
+                ydl_module=ydl,
+                min_bitrate_kbps=QUALITY_MIN_BITRATE_KBPS,
+                prefer_lossless=PREFER_LOSSLESS,
+                max_candidates=FALLBACK_MAX_CANDIDATES,
+                web_fallback=ENABLE_WEB_FALLBACK,
+                proxy=proxy,
+                source_ip=source_ip,
+            )
+            if better_source:
+                better_url, better_quality = better_source
+                if better_url != url:
+                    logger.info(
+                        "Failure fallback selected: %s (lossless=%s, bitrate=%sk)",
+                        better_url,
+                        better_quality.lossless,
+                        better_quality.bitrate_kbps,
+                    )
+                    shutil.rmtree(download_dir, ignore_errors=True)
+                    os.makedirs(download_dir, exist_ok=True)
+                    if ydl_download_audio_fallback(better_url, download_dir, source_ip=source_ip, proxy=proxy):
+                        url = better_url
+                        host = URL(url).host
+                        add_description += f"\n\nFallback source: {escape_markdown(better_url, version=1)}"
+                        status = "success"
 
     if status == "failed":
         run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=FAILED_TEXT, parse_mode="Markdown"))
