@@ -746,7 +746,22 @@ async def blacklist_whitelist_callback(update: Update, context: ContextTypes.DEF
 
 
 async def unknown_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return
+    message = update.effective_message
+    if not message or not getattr(message, "text", None):
+        return
+    text = message.text.strip()
+    # Accept accidental "/Artist Track" syntax as a plain search query.
+    if text.startswith("/") and " " in text:
+        command_head, command_tail = text.split(" ", 1)
+        query = f"{command_head.lstrip('/')} {command_tail}".strip()
+        if query:
+            await run_search_query(update, context, query, "search_msg")
+            return
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        reply_to_message_id=message.message_id,
+        text="Unknown command.\nUse /search <artist> <track> or send plain text query.",
+    )
 
 
 async def error_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):  # skipcq: PYL-R0201
