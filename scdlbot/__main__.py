@@ -394,6 +394,7 @@ def get_command_reply_keyboard(include_restart=False):
     rows = [
         [KeyboardButton("/help"), KeyboardButton("/settings")],
         [KeyboardButton("/search"), KeyboardButton("/dl")],
+        [KeyboardButton("/link")],
     ]
     if include_restart:
         rows.append([KeyboardButton("/restart")])
