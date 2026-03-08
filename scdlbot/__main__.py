@@ -1581,7 +1581,6 @@ def main():
         # https://github.com/python-telegram-bot/python-telegram-bot/discussions/3310
         # https://github.com/python-telegram-bot/python-telegram-bot/wiki/Frequently-requested-design-patterns#running-ptb-alongside-other-asyncio-frameworks
         # https://docs.python-telegram-bot.org/en/v21.5/examples.customwebhookbot.html
-        application.bot.delete_webhook()
         application.run_polling(
             drop_pending_updates=True,
         )
