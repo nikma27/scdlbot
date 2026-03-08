@@ -16,6 +16,7 @@
 • Bandcamp
 • YouTube
 • VK
+• Texamp
 • и другие сайты из экосистемы `yt-dlp`.
 
 *Важно:*

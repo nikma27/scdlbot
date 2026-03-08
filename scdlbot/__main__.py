@@ -271,7 +271,25 @@ DOMAIN_TW = "twitter.com"
 DOMAIN_TWX = "x.com"
 DOMAIN_VK = "vk.com"
 DOMAIN_VK_RU = "vk.ru"
-DOMAINS_STRINGS = [DOMAIN_SC, DOMAIN_SC_ON, DOMAIN_SC_API, DOMAIN_SC_GOOGL, DOMAIN_BC, DOMAIN_YT, DOMAIN_YT_BE, DOMAIN_YMR, DOMAIN_YMC, DOMAIN_TT, DOMAIN_IG, DOMAIN_TW, DOMAIN_TWX, DOMAIN_VK, DOMAIN_VK_RU]
+DOMAIN_TEXAMP = "texamp.com"
+DOMAINS_STRINGS = [
+    DOMAIN_SC,
+    DOMAIN_SC_ON,
+    DOMAIN_SC_API,
+    DOMAIN_SC_GOOGL,
+    DOMAIN_BC,
+    DOMAIN_YT,
+    DOMAIN_YT_BE,
+    DOMAIN_YMR,
+    DOMAIN_YMC,
+    DOMAIN_TT,
+    DOMAIN_IG,
+    DOMAIN_TW,
+    DOMAIN_TWX,
+    DOMAIN_VK,
+    DOMAIN_VK_RU,
+    DOMAIN_TEXAMP,
+]
 DOMAINS = [rf"^(?:[^\s]+\.)?{re.escape(domain_string)}$" for domain_string in DOMAINS_STRINGS]
 
 AUDIO_FORMATS = ["mp3"]
@@ -1139,6 +1157,9 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
         elif DOMAIN_VK in url.host or DOMAIN_VK_RU in url.host:
             # VK: audio, video
             urls_dict[url_text] = "http"
+        elif DOMAIN_TEXAMP in url.host:
+            # Texamp links: let yt-dlp resolve and download.
+            urls_dict[url_text] = "http"
     return urls_dict
 
 
@@ -1763,6 +1784,8 @@ def download_url_and_send(
                         source = "Bandcamp"
                     elif DOMAIN_VK in host or DOMAIN_VK_RU in host:
                         source = "VK"
+                    elif DOMAIN_TEXAMP in host:
+                        source = "Texamp"
                     else:
                         source = url_obj.host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "")
                     # TODO fix youtube id in [] ?
