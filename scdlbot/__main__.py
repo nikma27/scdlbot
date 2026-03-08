@@ -719,18 +719,35 @@ def get_source_name(host: str) -> str:
 
 
 def format_search_choice_quality(quality):
-    quality_text = format_quality_label(quality)
+    if quality.lossless:
+        base = "lossless"
+    else:
+        bitrate = int(quality.bitrate_kbps) if quality.bitrate_kbps else 0
+        base = f"{bitrate} kbps" if bitrate else "битрейт ?"
+    details = [base]
+    if quality.sample_rate:
+        details.append(f"{quality.sample_rate} Hz")
     if quality.max_video_height:
-        quality_text = f"{quality_text}, {quality.max_video_height}p"
+        details.append(f"{quality.max_video_height}p")
     if quality.extension and quality.extension != "unknown":
-        quality_text = f"{quality_text}, {quality.extension.upper()}"
-    return quality_text
+        details.append(quality.extension.upper())
+    return " · ".join(details)
+
+
+def get_quality_points(quality):
+    points = 0
+    if quality.lossless:
+        points += 1000
+    points += int(quality.bitrate_kbps or 0)
+    points += int((quality.sample_rate or 0) / 1000)
+    points += int((quality.max_video_height or 0) / 10)
+    return points
 
 
 def get_search_choice_inline_keyboard(search_token: str, choices: list[dict]) -> InlineKeyboardMarkup:
     rows = []
     for idx, choice in enumerate(choices):
-        button_text = f"{idx + 1}) {choice['source']} · {choice['quality']}"
+        button_text = f"{idx + 1}) {choice['source']} · {choice['quality_short']}"
         rows.append([InlineKeyboardButton(text=button_text[:64], callback_data=f"search_choice {search_token} {idx}")])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"search_choice {search_token} cancel")])
     return InlineKeyboardMarkup(rows)
@@ -806,6 +823,38 @@ def build_track_caption(file_path: str, host: str) -> str:
     if len(caption) > 1020:
         caption = caption[:1017] + "..."
     return caption
+
+
+def find_best_album_thumbnail(download_dir: str, audio_file: str) -> str | None:
+    audio_path = pathlib.Path(audio_file)
+    candidate_paths = []
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate_paths.append(audio_path.with_suffix(ext))
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate_paths.extend(pathlib.Path(download_dir).glob(f"*{ext}"))
+    source = next((str(path) for path in candidate_paths if pathlib.Path(path).exists()), None)
+    if not source:
+        return None
+    thumb_path = os.path.join(download_dir, f"thumb_{uuid4().hex[:8]}.jpg")
+    try:
+        (
+            ffmpeg.input(source)
+            .output(
+                thumb_path,
+                vframes=1,
+                vf="scale='if(gt(iw,320),320,iw)':'if(gt(ih,320),320,ih)'",
+                **{"q:v": 8},
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+    except Exception:
+        return None
+    if not os.path.exists(thumb_path):
+        return None
+    if os.path.getsize(thumb_path) > 200_000:
+        return None
+    return thumb_path
 
 
 async def handle_quick_button_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
@@ -895,13 +944,20 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         )
         return
     choices = []
-    for url_item, quality_item in results[:SEARCH_RESULT_LIMIT]:
+    for idx, (url_item, quality_item) in enumerate(results[:SEARCH_RESULT_LIMIT]):
         host = URL(url_item).host if url_item.startswith("http") else "unknown"
+        quality_text = format_search_choice_quality(quality_item)
+        quality_points = get_quality_points(quality_item)
+        rank_label = "🥇 Лучшее" if idx == 0 else f"{idx + 1}"
         choices.append(
             {
                 "url": url_item,
                 "source": get_source_name(host),
-                "quality": format_search_choice_quality(quality_item),
+                "quality": quality_text,
+                "quality_short": quality_text,
+                "points": quality_points,
+                "title": (quality_item.title or "").strip(),
+                "rank": rank_label,
             }
         )
     if len(choices) == 1:
@@ -940,11 +996,17 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         "query": query,
         "reply_to_message_id": update.effective_message.message_id,
     }
-    options_preview = "\n".join([f"{idx + 1}. {item['source']} — {item['quality']}" for idx, item in enumerate(choices)])
+    options_preview = "\n".join(
+        [
+            f"{item['rank']}. {item['source']} — {item['quality']} (оценка {item['points']})"
+            + (f"\n   └ {item['title'][:80]}" if item.get("title") else "")
+            for item in choices
+        ]
+    )
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=wait_message.message_id,
-        text=f"🎧 Найдено несколько вариантов. Выберите качество:\n{options_preview}",
+        text=f"🎧 Найдено несколько вариантов. Выберите лучший по качеству:\n{options_preview}",
         reply_markup=get_search_choice_inline_keyboard(search_token, choices),
         disable_web_page_preview=True,
     )
@@ -1191,9 +1253,9 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await update.callback_query.edit_message_text(text="Вариант устарел, запустите поиск ещё раз.")
             return
         selected_choice = choices[selected_index]
-        await update.callback_query.answer(text=f"Выбрано: {selected_choice['quality']}")
+        await update.callback_query.answer(text=f"Выбрано: {selected_choice['quality_short']}")
         await update.callback_query.edit_message_text(
-            text=f"✅ Выбран вариант: {selected_choice['source']} ({selected_choice['quality']}). Скачиваю..."
+            text=f"✅ Выбран вариант: {selected_choice['source']} ({selected_choice['quality_short']}). Скачиваю..."
         )
         kwargs = {
             "bot_options": {
@@ -2101,6 +2163,7 @@ def download_url_and_send(
                         )
                     )
                 reply_to_message_id_send = reply_to_message_id if flood else None
+                thumbnail_path = find_best_album_thumbnail(download_dir, file)
                 sent_audio_ids = []
                 for index, file_part in enumerate(file_parts):
                     path = pathlib.Path(file_part)
@@ -2128,6 +2191,7 @@ def download_url_and_send(
                                 duration = round(mp3.info.length)
                                 performer = None
                                 title = None
+                                thumbnail = None
                                 try:
                                     performer = ", ".join(mp3["artist"])
                                     title = ", ".join(mp3["title"])
@@ -2138,24 +2202,33 @@ def download_url_and_send(
                                     logger.debug(audio)
                                 else:
                                     audio = open(file_part, "rb")
+                                if thumbnail_path and os.path.exists(thumbnail_path):
+                                    thumbnail = open(thumbnail_path, "rb")
                                 # Bot.send_audio() has connection troubles when running async in parallel:
                                 # Works bad on my computer with official API (good with high timeout)
                                 # Works good on server with local API.
-                                audio_msg = run_async(
-                                    bot.send_audio(
-                                        chat_id=chat_id,
-                                        reply_to_message_id=reply_to_message_id_send,
-                                        audio=audio,
-                                        duration=duration,
-                                        performer=performer,
-                                        title=title,
-                                        caption=caption_full,
-                                        read_timeout=COMMON_CONNECTION_TIMEOUT,
-                                        write_timeout=COMMON_CONNECTION_TIMEOUT,
-                                        connect_timeout=COMMON_CONNECTION_TIMEOUT,
-                                        pool_timeout=COMMON_CONNECTION_TIMEOUT,
-                                    ),
-                                )
+                                try:
+                                    audio_msg = run_async(
+                                        bot.send_audio(
+                                            chat_id=chat_id,
+                                            reply_to_message_id=reply_to_message_id_send,
+                                            audio=audio,
+                                            duration=duration,
+                                            performer=performer,
+                                            title=title,
+                                            caption=caption_full,
+                                            thumbnail=thumbnail,
+                                            read_timeout=COMMON_CONNECTION_TIMEOUT,
+                                            write_timeout=COMMON_CONNECTION_TIMEOUT,
+                                            connect_timeout=COMMON_CONNECTION_TIMEOUT,
+                                            pool_timeout=COMMON_CONNECTION_TIMEOUT,
+                                        ),
+                                    )
+                                finally:
+                                    if not TG_BOT_API_LOCAL_MODE and hasattr(audio, "close"):
+                                        audio.close()
+                                    if thumbnail and hasattr(thumbnail, "close"):
+                                        thumbnail.close()
                                 sent_audio_ids.append(audio_msg.audio.file_id)
                                 logger.debug("Sending audio succeeded: %s", file_name)
                                 break
@@ -2165,22 +2238,26 @@ def download_url_and_send(
                                 videostream = next(item for item in ffmpeg.probe(file_part)["streams"] if item["codec_type"] == "video")
                                 width = int(videostream["width"])
                                 height = int(videostream["height"])
-                                video_msg = run_async(
-                                    bot.send_video(
-                                        chat_id=chat_id,
-                                        reply_to_message_id=reply_to_message_id_send,
-                                        video=video,
-                                        supports_streaming=True,
-                                        duration=duration,
-                                        width=width,
-                                        height=height,
-                                        caption=caption_full,
-                                        read_timeout=COMMON_CONNECTION_TIMEOUT,
-                                        write_timeout=COMMON_CONNECTION_TIMEOUT,
-                                        connect_timeout=COMMON_CONNECTION_TIMEOUT,
-                                        pool_timeout=COMMON_CONNECTION_TIMEOUT,
-                                    ),
-                                )
+                                try:
+                                    video_msg = run_async(
+                                        bot.send_video(
+                                            chat_id=chat_id,
+                                            reply_to_message_id=reply_to_message_id_send,
+                                            video=video,
+                                            supports_streaming=True,
+                                            duration=duration,
+                                            width=width,
+                                            height=height,
+                                            caption=caption_full,
+                                            read_timeout=COMMON_CONNECTION_TIMEOUT,
+                                            write_timeout=COMMON_CONNECTION_TIMEOUT,
+                                            connect_timeout=COMMON_CONNECTION_TIMEOUT,
+                                            pool_timeout=COMMON_CONNECTION_TIMEOUT,
+                                        ),
+                                    )
+                                finally:
+                                    if hasattr(video, "close"):
+                                        video.close()
                                 sent_audio_ids.append(video_msg.video.file_id)
                                 logger.debug("Sending video succeeded: %s", file_name)
                                 break
