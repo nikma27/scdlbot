@@ -44,6 +44,31 @@ test: lint package
 .PHONY: test_fast
 test_fast: lint package_fast
 
+.PHONY: cloud_bootstrap
+cloud_bootstrap:
+	bash ./cloud_startup.sh
+
+.PHONY: cloud_preflight
+cloud_preflight:
+	set -o allexport; \
+	source .env.cloud; \
+	set +o allexport; \
+	bash ./scripts/cloud_preflight.sh
+
+.PHONY: cloud_dry_run
+cloud_dry_run:
+	set -o allexport; \
+	source .env.cloud; \
+	set +o allexport; \
+	CLOUD_DRY_RUN=1 bash ./scripts/run_cloud_bot.sh
+
+.PHONY: cloud_run
+cloud_run:
+	set -o allexport; \
+	source .env.cloud; \
+	set +o allexport; \
+	bash ./scripts/run_cloud_bot.sh
+
 .PHONY: run_dev
 run_dev:
 	ps -ef | grep '[s]cdlbot' | grep 'python' | grep -v 'bash' | awk '{print $$2}' | xargs --no-run-if-empty kill -9
