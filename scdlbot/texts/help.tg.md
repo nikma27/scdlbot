@@ -7,7 +7,7 @@ _Send or forward_ a text message containing links and I will:
 • In *Ask* mode: scan for supported links and ask you to choose what to do with them: download or get links
 • Use /settings to select working mode for messages sent *without direct command* (simple messages with links).
 • Use /settings to toggle *Captions*.
-• Use `/search <query>` to search audio/video on *VK*.
+• Use `/search <artist> <track>` or just send plain text to search the best available quality across platforms (with web fallback).
 • [Privacy mode](https://core.telegram.org/bots/features#privacy-mode) is _disabled_, so that I scan every group message.
 • Supported links and streaming websites:
 - *SoundCloud*: tracks/playlists/pages with private widgets

@@ -20,7 +20,7 @@ from importlib import resources
 from logging.handlers import SysLogHandler
 from multiprocessing import get_context
 from subprocess import PIPE, TimeoutExpired  # skipcq: BAN-B404
-from urllib.parse import quote, urljoin
+from urllib.parse import urljoin
 from uuid import uuid4
 
 import ffmpeg
@@ -59,8 +59,11 @@ from plumbum import ProcessExecutionError, local
 
 from scdlbot.quality_fallback import (
     build_query_from_local_tags,
+    discover_platform_candidates,
+    discover_web_candidates,
     find_better_source,
     inspect_local_audio_quality,
+    probe_remote_quality,
 )
 
 # Use maximum 1500 mebibytes per task:
@@ -117,6 +120,7 @@ PREFER_LOSSLESS = bool(int(os.getenv("PREFER_LOSSLESS", "1")))
 ENABLE_CROSS_PLATFORM_SEARCH = bool(int(os.getenv("ENABLE_CROSS_PLATFORM_SEARCH", "1")))
 ENABLE_WEB_FALLBACK = bool(int(os.getenv("ENABLE_WEB_FALLBACK", "1")))
 FALLBACK_MAX_CANDIDATES = int(os.getenv("FALLBACK_MAX_CANDIDATES", "8"))
+SEARCH_RESULT_LIMIT = int(os.getenv("SEARCH_RESULT_LIMIT", "5"))
 NO_FLOOD_CHAT_IDS = list(map(int, os.getenv("NO_FLOOD_CHAT_IDS", "0").split(",")))
 COOKIES_FILE = os.getenv("COOKIES_FILE", None)
 PROXIES = []
@@ -400,29 +404,89 @@ async def settings_command_callback(update: Update, context: ContextTypes.DEFAUL
     await context.bot.send_message(chat_id=chat_id, parse_mode="Markdown", reply_markup=get_settings_inline_keyboard(context.chat_data), text=SETTINGS_TEXT)
 
 
-async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search on vk.com - returns links to VK audio and video search."""
-    command_name = "search"
+def search_high_quality_sources(query, source_ip=None, proxy=None):
+    """Search candidate links and rank by available audio quality."""
+    candidates = discover_platform_candidates(query, ydl, FALLBACK_MAX_CANDIDATES)
+    if ENABLE_WEB_FALLBACK:
+        candidates.extend(discover_web_candidates(query, FALLBACK_MAX_CANDIDATES))
+    seen = set()
+    ranked = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        quality = probe_remote_quality(candidate, ydl, proxy=proxy, source_ip=source_ip)
+        if quality is None:
+            continue
+        score = (
+            1 if quality.lossless else 0,
+            quality.bitrate_kbps,
+            quality.sample_rate or 0,
+        )
+        ranked.append((score, candidate, quality))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [(url, quality) for _, url, quality in ranked[:SEARCH_RESULT_LIMIT]]
+
+
+def format_search_result_text(query, results):
+    """Render plain-text search results for Telegram."""
+    if not results:
+        return (
+            "Ничего подходящего не найдено.\n\n"
+            "Попробуйте более точный запрос: `Исполнитель - Трек`.\n"
+            "Либо отправьте прямую ссылку на релиз/трек."
+        )
+    lines = [f"🔍 Search results for: {query}", ""]
+    for index, (url, quality) in enumerate(results, 1):
+        host = URL(url).host if url.startswith("http") else "unknown"
+        quality_label = "lossless" if quality.lossless else f"{int(quality.bitrate_kbps) if quality.bitrate_kbps else 0} kbps"
+        sr_label = f", {quality.sample_rate} Hz" if quality.sample_rate else ""
+        lines.append(f"{index}. {host} — {quality_label}{sr_label}")
+        lines.append(url)
+        lines.append("")
+    lines.append("Для скачивания отправьте нужную ссылку отдельным сообщением.")
+    return "\n".join(lines).strip()
+
+
+async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, command_name: str):
+    """Execute unified search workflow and send ranked results."""
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     if not chat_allowed(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="This command isn't allowed in this chat.")
         return
-    if not context.args:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Usage: `/search <query>`\n\nExample: `/search Pink Floyd`",
-            parse_mode="Markdown",
-        )
+    if len(query.strip()) < 2:
         return
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
+    source_ip = random.choice(SOURCE_IPS) if SOURCE_IPS else None
+    proxy = random.choice(PROXIES) if PROXIES else None
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    loop_main = asyncio.get_running_loop()
+    results = await loop_main.run_in_executor(None, search_high_quality_sources, query, source_ip, proxy)
+    text = format_search_result_text(query, results)
+    await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True, reply_to_message_id=update.effective_message.message_id)
+
+
+async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for best available sources by artist/title query."""
+    if not context.args:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Usage: /search <artist> <track>\n\nExample: /search Daft Punk One More Time",
+        )
+        return
     query = " ".join(context.args)
-    query_encoded = quote(query, safe="")
-    audio_url = f"https://vk.com/audio?q={query_encoded}"
-    video_url = f"https://vk.com/video?q={query_encoded}"
-    text = f"🔍 *VK Search* for _{escape_markdown(query, version=1)}_\n\n• [Audio]({audio_url})\n• [Video]({video_url})\n\n_Send me a direct link to download_"
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
+    await run_search_query(update, context, query, "search_cmd")
+
+
+async def search_query_message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Treat plain text messages as search queries in unified mode."""
+    message = update.effective_message
+    if not message or not getattr(message, "text", None):
+        return
+    query = message.text.strip()
+    await run_search_query(update, context, query, "search_msg")
 
 
 async def dl_link_commands_and_messages_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1629,6 +1693,14 @@ def main():
     search_command_handler = CommandHandler("search", search_command_callback)
     dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED)
     link_command_handler = CommandHandler("link", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED)
+    search_query_message_handler = MessageHandler(
+        ~filters.UpdateType.EDITED_MESSAGE
+        & ~filters.ForwardedFrom(username=bot_username)
+        & ~filters.COMMAND
+        & filters.TEXT
+        & ~(filters.Entity(MessageEntity.URL) | filters.Entity(MessageEntity.TEXT_LINK)),
+        search_query_message_callback,
+    )
     message_with_links_handler = MessageHandler(
         ~filters.UpdateType.EDITED_MESSAGE
         & ~filters.ForwardedFrom(username=bot_username)
@@ -1649,6 +1721,7 @@ def main():
     application.add_handler(search_command_handler)
     application.add_handler(dl_command_handler)
     application.add_handler(link_command_handler)
+    application.add_handler(search_query_message_handler)
     application.add_handler(message_with_links_handler)
     application.add_handler(button_query_handler)
     application.add_handler(unknown_handler)
