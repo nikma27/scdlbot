@@ -4,6 +4,8 @@ Use this checklist to run `scdlbot`/`flacbot` only in cloud environments.
 
 ## 1) Bootstrap runtime
 
+Run all commands from repository root (`/workspace` in Cursor Cloud).
+
 1. `bash ./cloud_startup.sh`
 2. `cp .env.cloud.sample .env.cloud`
 3. Fill secrets in `.env.cloud`:

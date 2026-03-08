@@ -988,6 +988,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     if not chat_allowed(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
+    # Private chats default to direct download mode; group chats default to ask mode.
     init_chat_data(
         chat_data=context.chat_data,
         mode=("dl" if chat_type == Chat.PRIVATE else "ask"),

@@ -4,7 +4,7 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 if ! command -v poetry >/dev/null 2>&1; then
-  echo "poetry is missing; run: bash ./cloud_startup.sh" >&2
+  echo "poetry is missing; run: bash ./cloud_startup.sh (and ensure .env.cloud exists: cp .env.cloud.sample .env.cloud)" >&2
   exit 1
 fi
 
