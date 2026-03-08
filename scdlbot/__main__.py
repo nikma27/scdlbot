@@ -243,6 +243,7 @@ def get_response_text(file_name):
 
 HELP_TEXT = get_response_text("help.tg.md")
 SETTINGS_TEXT = get_response_text("settings.tg.md")
+START_TEXT = "Готов к работе. Пришлите ссылку или запрос вида: Исполнитель - Трек."
 DL_TIMEOUT_TEXT = get_response_text("dl_timeout.txt").format(DL_TIMEOUT // 60)
 WAIT_BIT_TEXT = [get_response_text("wait_bit.txt"), get_response_text("wait_beat.txt"), get_response_text("wait_beet.txt")]
 NO_URLS_TEXT = get_response_text("no_urls.txt")
@@ -408,9 +409,17 @@ async def start_help_commands_callback(update: Update, context: ContextTypes.DEF
     for entity_value in entities.values():
         command_name = entity_value.replace("/", "").replace(f"@{context.bot.username}", "").lower()
         break
+    logger.info("received command: %s chat_id=%s", command_name, chat_id)
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
-    await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
+    if command_name == "start":
+        # Plain text first to guarantee a visible quick response.
+        await context.bot.send_message(chat_id=chat_id, text=START_TEXT, disable_web_page_preview=True)
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception:
+        # Fallback without markdown if Telegram rejects formatting.
+        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, disable_web_page_preview=True)
 
 
 async def settings_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
