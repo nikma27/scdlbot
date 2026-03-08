@@ -123,6 +123,14 @@ These are low-risk, backwards-compatible updates:
 
 ---
 
+## 8. Cloud Environment Policy (Cursor)
+
+- Startup bootstrap should install from lock file only (`poetry install --with main,dev,docs,flacbot --sync`) and **must not** auto-upgrade dependencies.
+- Keep major upgrades flagged in this report (currently `scdl` and `doc8`) in separate PRs with targeted validation.
+- Ensure system FFmpeg availability before bot/runtime checks to avoid false-negative failures in smoke tests.
+
+---
+
 ## Files Referenced
 
 - `pyproject.toml` — Poetry project definition

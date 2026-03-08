@@ -17,8 +17,11 @@
 
 | Task | Command |
 |---|---|
-| Install dependencies | `poetry install --with main,dev,docs` |
+| Bootstrap cloud env | `bash ./cloud_startup.sh` |
+| Install dependencies | `poetry install --with main,dev,docs,flacbot --sync` |
+| Verify FFmpeg | `ffmpeg -version` |
 | Lint + package checks | `make test` |
+| Fast checks for inner loop | `make test_fast` |
 | Format code | `make format` |
 | Run bot (dev) | `make run_dev` (reads `.env-dev`) |
 | Run bot (manual) | `TG_BOT_TOKEN=<token> poetry run python -m scdlbot` |
@@ -27,6 +30,22 @@
 
 - `TG_BOT_TOKEN` env var is **required** at module import time (`os.environ["TG_BOT_TOKEN"]`), so even importing the module will fail without it.
 - The `make test` target runs `lint` (currently no-op / commented out) and `package` (`poetry check`, `pip check`, `safety check`). There are no unit tests.
+- `make test_fast` is intended for quick feedback in cloud sessions; it skips `poetry check` and vulnerability scan, so run full `make test` before shipping changes.
 - `poetry lock` may be needed if `pyproject.toml` has changed since the lock file was last generated. The update script handles this.
 - The `lint` Makefile target is effectively a no-op (linters are commented out). Formatting is done via `make format` (isort + black).
-- `poetry` is installed to `~/.local/bin` — ensure `PATH` includes it.
+- `poetry` is installed to `~/.local/bin`; startup scripts should always export `PATH="$HOME/.local/bin:$PATH"` before running Poetry commands.
+
+### Recommended cloud startup script
+
+Use and keep `cloud_startup.sh` as the default startup routine in Cursor Cloud:
+
+1. Export `~/.local/bin` in `PATH`
+2. Ensure Poetry is installed (install via `python3 -m pip install --user poetry` when missing)
+3. Verify FFmpeg is available in `PATH`
+4. Run `poetry install --with main,dev,docs,flacbot --sync`
+
+### make test optimization ideas
+
+- Use `make test_fast` during edit/debug loops and run full `make test` only before commit.
+- Replace deprecated `safety check` with `safety scan` in a dedicated follow-up to avoid future CLI breakage.
+- Keep `poetry.lock` in sync to avoid expensive retry cycles when `poetry check` fails early.

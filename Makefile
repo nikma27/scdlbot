@@ -18,9 +18,13 @@ package:
 	poetry run pip check
 	poetry run safety check --full-report
 
+.PHONY: package_fast
+package_fast:
+	poetry run pip check
+
 .PHONY: install
 install:
-	poetry install --with main,dev,docs --sync
+	poetry install --with main,dev,docs,flacbot --sync
 
 .PHONY: update
 update:
@@ -36,6 +40,9 @@ update:
 
 .PHONY: test
 test: lint package
+
+.PHONY: test_fast
+test_fast: lint package_fast
 
 .PHONY: run_dev
 run_dev:
