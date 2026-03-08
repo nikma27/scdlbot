@@ -59,6 +59,7 @@ from plumbum import ProcessExecutionError, local
 
 from scdlbot.quality_fallback import (
     build_query_from_local_tags,
+    compute_title_match_ratio,
     discover_platform_candidates,
     discover_web_candidates,
     find_better_source,
@@ -124,6 +125,7 @@ PREFER_LOSSLESS = bool(int(os.getenv("PREFER_LOSSLESS", "1")))
 ENABLE_CROSS_PLATFORM_SEARCH = bool(int(os.getenv("ENABLE_CROSS_PLATFORM_SEARCH", "1")))
 ENABLE_WEB_FALLBACK = bool(int(os.getenv("ENABLE_WEB_FALLBACK", "1")))
 FALLBACK_MAX_CANDIDATES = int(os.getenv("FALLBACK_MAX_CANDIDATES", "8"))
+YOUTUBE_MIN_HEIGHT = int(os.getenv("YOUTUBE_MIN_HEIGHT", "1080"))
 SEARCH_RESULT_LIMIT = int(os.getenv("SEARCH_RESULT_LIMIT", "5"))
 NO_FLOOD_CHAT_IDS = list(map(int, os.getenv("NO_FLOOD_CHAT_IDS", "0").split(",")))
 COOKIES_FILE = os.getenv("COOKIES_FILE", None)
@@ -481,7 +483,7 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
     """Search candidate links and rank by available audio quality."""
     query_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", query.lower()))
     query_tokens = {x for x in query_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
-    candidates = discover_platform_candidates(query, ydl, FALLBACK_MAX_CANDIDATES)
+    candidates = discover_platform_candidates(query, ydl, FALLBACK_MAX_CANDIDATES, prefer_youtube=True)
     if ENABLE_WEB_FALLBACK:
         candidates.extend(discover_web_candidates(query, FALLBACK_MAX_CANDIDATES))
     seen = set()
@@ -496,16 +498,22 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
         relevance = 0.0
         if query_tokens:
             relevance = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
-            if relevance < 0.2:
-                continue
         quality = probe_remote_quality(candidate, ydl, proxy=proxy, source_ip=source_ip)
         if quality is None:
             continue
+        title_relevance = compute_title_match_ratio(query, quality.title or candidate)
+        if title_relevance < 0.45:
+            continue
+        host = (URL(candidate).host or "").lower()
+        youtube_hd = 1 if (DOMAIN_YT in host or DOMAIN_YT_BE in host) and quality.max_video_height >= YOUTUBE_MIN_HEIGHT else 0
         score = (
+            youtube_hd,
+            title_relevance,
             relevance,
             1 if quality.lossless else 0,
             quality.bitrate_kbps,
             quality.sample_rate or 0,
+            quality.max_video_height or 0,
         )
         ranked.append((score, candidate, quality))
     ranked.sort(key=lambda x: x[0], reverse=True)
@@ -1260,12 +1268,23 @@ def collect_downloaded_files(download_dir):
 
 def ydl_download_audio_fallback(url, download_dir, source_ip=None, proxy=None):
     """Download audio-only URL using yt-dlp fallback options."""
+    ydl_format = "bestaudio/best"
+    try:
+        host = (URL(url).host or "").lower()
+    except Exception:
+        host = ""
+    if DOMAIN_YT in host or DOMAIN_YT_BE in host:
+        # Prefer YouTube sources with >=1080p video to maximize source quality before audio extraction.
+        ydl_format = (
+            f"bestvideo*[height>={YOUTUBE_MIN_HEIGHT}]+bestaudio/"
+            f"best[height>={YOUTUBE_MIN_HEIGHT}]/bestvideo+bestaudio/bestaudio/best"
+        )
     ydl_opts = {
         "outtmpl": os.path.join(download_dir, "%(title).16s [%(id)s].%(ext)s"),
         "restrictfilenames": True,
         "windowsfilenames": True,
         "max_filesize": MAX_TG_FILE_SIZE * 3,
-        "format": "bestaudio/best",
+        "format": ydl_format,
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"},
             {"key": "FFmpegMetadata"},
@@ -1576,6 +1595,8 @@ def download_url_and_send(
                 web_fallback=ENABLE_WEB_FALLBACK,
                 proxy=proxy,
                 source_ip=source_ip,
+                prefer_youtube=True,
+                youtube_min_height=YOUTUBE_MIN_HEIGHT,
             )
             if better_source:
                 better_url, better_quality = better_source
@@ -1615,6 +1636,9 @@ def download_url_and_send(
             if current_quality:
                 if current_quality.lossless:
                     should_search_better = False
+                elif DOMAIN_BC in host:
+                    # For Bandcamp links, aggressively try YouTube HD fallback if source is not lossless.
+                    should_search_better = True
                 elif current_quality.bitrate_kbps < QUALITY_MIN_BITRATE_KBPS:
                     should_search_better = True
                 elif PREFER_LOSSLESS:
@@ -1633,6 +1657,8 @@ def download_url_and_send(
                     web_fallback=ENABLE_WEB_FALLBACK,
                     proxy=proxy,
                     source_ip=source_ip,
+                    prefer_youtube=True,
+                    youtube_min_height=YOUTUBE_MIN_HEIGHT,
                 )
                 if better_source:
                     better_url, better_quality = better_source

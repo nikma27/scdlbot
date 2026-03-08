@@ -37,3 +37,4 @@ Use this checklist to run `scdlbot`/`flacbot` only in cloud environments.
   - `PREFER_LOSSLESS` (`1` means try to upgrade lossy tracks)
   - `ENABLE_CROSS_PLATFORM_SEARCH` and `ENABLE_WEB_FALLBACK`
   - `FALLBACK_MAX_CANDIDATES` to cap probing cost.
+  - `YOUTUBE_MIN_HEIGHT` (default `1080`) for YouTube HD-priority fallback.

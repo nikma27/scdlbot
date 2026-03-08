@@ -13,7 +13,8 @@ from mutagen import File as MutagenFile
 
 
 LOSSLESS_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
-PREFERRED_SEARCH_PREFIXES = ("ytsearch5", "scsearch5")
+DEFAULT_SEARCH_PREFIXES = ("ytsearch10", "scsearch5")
+YOUTUBE_FOCUSED_SEARCH_PREFIXES = ("ytsearch20", "ytsearch10", "scsearch5")
 
 
 class _YdlSilentLogger:
@@ -36,6 +37,8 @@ class AudioQuality:
     sample_rate: int | None
     extension: str
     source_url: str
+    title: str = ""
+    max_video_height: int = 0
 
 
 def _safe_lower(value: str | None) -> str:
@@ -44,6 +47,24 @@ def _safe_lower(value: str | None) -> str:
 
 def _clean_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def _tokenize(value: str | None) -> set[str]:
+    return {token for token in re.findall(r"[a-zA-Zа-яА-Я0-9]+", _safe_lower(value)) if len(token) > 1}
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = _safe_lower(urlparse(url).netloc)
+    return "youtube.com" in host or "youtu.be" in host
+
+
+def compute_title_match_ratio(query: str, candidate_title: str) -> float:
+    """Return overlap ratio between query tokens and candidate title tokens."""
+    query_tokens = _tokenize(query)
+    title_tokens = _tokenize(candidate_title)
+    if not query_tokens or not title_tokens:
+        return 0.0
+    return len(query_tokens & title_tokens) / max(1, len(query_tokens))
 
 
 def inspect_local_audio_quality(file_paths: list[str]) -> AudioQuality | None:
@@ -126,17 +147,21 @@ def find_better_source(
     web_fallback: bool,
     proxy: str | None,
     source_ip: str | None,
+    prefer_youtube: bool = False,
+    youtube_min_height: int = 1080,
 ) -> tuple[str, AudioQuality] | None:
     """Find better source URL by searching platforms, then web."""
     if not query:
         return None
 
-    candidates = discover_platform_candidates(query, ydl_module, max_candidates)
+    candidates = discover_platform_candidates(query, ydl_module, max_candidates, prefer_youtube=prefer_youtube)
     if web_fallback:
         candidates.extend(discover_web_candidates(query, max_candidates))
 
     seen = set()
     best_pair: tuple[str, AudioQuality] | None = None
+    best_score: tuple[float, ...] | None = None
+    best_title_match = 0.0
     for candidate_url in candidates:
         if candidate_url in seen:
             continue
@@ -144,24 +169,48 @@ def find_better_source(
         quality = probe_remote_quality(candidate_url, ydl_module, proxy=proxy, source_ip=source_ip)
         if not quality:
             continue
+        title_match = compute_title_match_ratio(query, quality.title or candidate_url)
+        if _is_youtube_url(candidate_url) and title_match < 0.45:
+            continue
+        if prefer_youtube and _is_youtube_url(candidate_url) and quality.max_video_height and quality.max_video_height < youtube_min_height:
+            continue
         if not _meets_floor(quality, min_bitrate_kbps=min_bitrate_kbps, prefer_lossless=prefer_lossless):
             # Keep only if still better than current and no strict floor candidate exists.
             if not _is_candidate_better(quality, current_quality):
                 continue
-        if best_pair is None or _is_candidate_better(quality, best_pair[1]):
+        score = (
+            1.0 if _is_youtube_url(candidate_url) and quality.max_video_height >= youtube_min_height else 0.0,
+            title_match,
+            1.0 if quality.lossless else 0.0,
+            quality.bitrate_kbps,
+            float(quality.sample_rate or 0),
+            float(quality.max_video_height or 0),
+        )
+        if best_pair is None or best_score is None or score > best_score:
             best_pair = (candidate_url, quality)
+            best_score = score
+            best_title_match = title_match
 
     if not best_pair:
         return None
     if _is_candidate_better(best_pair[1], current_quality):
         return best_pair
+    if (
+        prefer_youtube
+        and _is_youtube_url(best_pair[0])
+        and best_pair[1].max_video_height >= youtube_min_height
+        and best_title_match >= 0.7
+    ):
+        return best_pair
     return None
 
 
-def discover_platform_candidates(query: str, ydl_module: Any, max_candidates: int) -> list[str]:
+def discover_platform_candidates(query: str, ydl_module: Any, max_candidates: int, *, prefer_youtube: bool = False) -> list[str]:
     """Discover candidate URLs from platform searches supported by yt-dlp."""
     results: list[str] = []
-    for prefix in PREFERRED_SEARCH_PREFIXES:
+    prefixes = YOUTUBE_FOCUSED_SEARCH_PREFIXES if prefer_youtube else DEFAULT_SEARCH_PREFIXES
+    target_limit = max(max_candidates, 12) if prefer_youtube else max_candidates
+    for prefix in prefixes:
         search_url = f"{prefix}:{query}"
         try:
             info = ydl_module.YoutubeDL(
@@ -183,9 +232,13 @@ def discover_platform_candidates(query: str, ydl_module: Any, max_candidates: in
             if not isinstance(entry, dict):
                 continue
             candidate = entry.get("webpage_url") or entry.get("url")
+            if candidate and not str(candidate).startswith("http"):
+                extractor = _safe_lower(str(entry.get("extractor_key") or entry.get("ie_key") or ""))
+                if extractor == "youtube" and re.fullmatch(r"[a-zA-Z0-9_-]{11}", str(candidate)):
+                    candidate = f"https://www.youtube.com/watch?v={candidate}"
             if candidate and candidate.startswith("http"):
                 results.append(candidate)
-            if len(results) >= max_candidates:
+            if len(results) >= target_limit:
                 return results
     return results
 
@@ -256,11 +309,16 @@ def probe_remote_quality(
         return None
 
     formats = info.get("formats") or []
+    title = _clean_text(str(info.get("track") or info.get("title") or ""))
+    max_video_height = 0
     best_lossless = None
     best_lossy = None
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
+        height = int(fmt.get("height") or 0)
+        if fmt.get("vcodec") not in (None, "none") and height > max_video_height:
+            max_video_height = height
         if fmt.get("vcodec") not in (None, "none"):
             continue
         ext = _safe_lower(fmt.get("ext"))
@@ -274,6 +332,8 @@ def probe_remote_quality(
             sample_rate=sample_rate,
             extension=ext or "unknown",
             source_url=url,
+            title=title,
+            max_video_height=max_video_height,
         )
         if q.lossless:
             if _is_candidate_better(q, best_lossless):
@@ -281,7 +341,10 @@ def probe_remote_quality(
         elif _is_candidate_better(q, best_lossy):
             best_lossy = q
 
-    return best_lossless or best_lossy
+    best = best_lossless or best_lossy
+    if best:
+        best.max_video_height = max_video_height
+    return best
 
 
 def _meets_floor(quality: AudioQuality, *, min_bitrate_kbps: int, prefer_lossless: bool) -> bool:
@@ -301,4 +364,6 @@ def _is_candidate_better(candidate: AudioQuality | None, current: AudioQuality |
         return candidate.lossless and not current.lossless
     if candidate.bitrate_kbps != current.bitrate_kbps:
         return candidate.bitrate_kbps > current.bitrate_kbps
-    return (candidate.sample_rate or 0) > (current.sample_rate or 0)
+    if (candidate.sample_rate or 0) != (current.sample_rate or 0):
+        return (candidate.sample_rate or 0) > (current.sample_rate or 0)
+    return (candidate.max_video_height or 0) > (current.max_video_height or 0)
