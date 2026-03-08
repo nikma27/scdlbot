@@ -1900,13 +1900,13 @@ def main():
         error_details = get_me_data.get("description", "unknown error")
         raise RuntimeError(f"Failed to fetch bot profile from Telegram API: {error_details}")
     bot_username = get_me_data["result"]["username"]
-    blacklist_whitelist_handler = MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, blacklist_whitelist_callback)
-    start_command_handler = CommandHandler("start", start_help_commands_callback)
-    help_command_handler = CommandHandler("help", start_help_commands_callback)
-    settings_command_handler = CommandHandler("settings", settings_command_callback)
-    search_command_handler = CommandHandler("search", search_command_callback)
-    dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED)
-    link_command_handler = CommandHandler("link", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED)
+    blacklist_whitelist_handler = MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, blacklist_whitelist_callback, block=False)
+    start_command_handler = CommandHandler("start", start_help_commands_callback, block=False)
+    help_command_handler = CommandHandler("help", start_help_commands_callback, block=False)
+    settings_command_handler = CommandHandler("settings", settings_command_callback, block=False)
+    search_command_handler = CommandHandler("search", search_command_callback, block=False)
+    dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED, block=False)
+    link_command_handler = CommandHandler("link", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED, block=False)
     search_query_message_handler = MessageHandler(
         ~filters.UpdateType.EDITED_MESSAGE
         & ~filters.ForwardedFrom(username=bot_username)
@@ -1914,6 +1914,7 @@ def main():
         & filters.TEXT
         & ~(filters.Entity(MessageEntity.URL) | filters.Entity(MessageEntity.TEXT_LINK)),
         search_query_message_callback,
+        block=False,
     )
     message_with_links_handler = MessageHandler(
         ~filters.UpdateType.EDITED_MESSAGE
@@ -1924,9 +1925,10 @@ def main():
             | (filters.CAPTION & (filters.CaptionEntity(MessageEntity.URL) | filters.CaptionEntity(MessageEntity.TEXT_LINK)))
         ),
         dl_link_commands_and_messages_callback,
+        block=False,
     )
-    button_query_handler = CallbackQueryHandler(button_press_callback)
-    unknown_handler = MessageHandler(filters.COMMAND, unknown_command_callback)
+    button_query_handler = CallbackQueryHandler(button_press_callback, block=False)
+    unknown_handler = MessageHandler(filters.COMMAND, unknown_command_callback, block=False)
 
     application.add_handler(blacklist_whitelist_handler)
     application.add_handler(start_command_handler)
