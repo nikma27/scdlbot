@@ -275,6 +275,25 @@ DOMAINS = [rf"^(?:[^\s]+\.)?{re.escape(domain_string)}$" for domain_string in DO
 
 AUDIO_FORMATS = ["mp3"]
 VIDEO_FORMATS = ["m4a", "mp4", "webm"]
+QUERY_STOPWORDS = {
+    "audio",
+    "track",
+    "tracks",
+    "playlist",
+    "playlists",
+    "music",
+    "video",
+    "videos",
+    "listen",
+    "слушайте",
+    "слушать",
+    "музыка",
+    "трек",
+    "треки",
+    "плейлист",
+    "вк",
+    "vk",
+}
 
 
 # TODO get rid of these dumb exceptions:
@@ -410,6 +429,8 @@ async def settings_command_callback(update: Update, context: ContextTypes.DEFAUL
 
 def search_high_quality_sources(query, source_ip=None, proxy=None):
     """Search candidate links and rank by available audio quality."""
+    query_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", query.lower()))
+    query_tokens = {x for x in query_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
     candidates = discover_platform_candidates(query, ydl, FALLBACK_MAX_CANDIDATES)
     if ENABLE_WEB_FALLBACK:
         candidates.extend(discover_web_candidates(query, FALLBACK_MAX_CANDIDATES))
@@ -419,10 +440,19 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
         if candidate in seen:
             continue
         seen.add(candidate)
+        candidate_text = unquote(urlparse(candidate).path + " " + urlparse(candidate).query).lower()
+        candidate_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", candidate_text))
+        candidate_tokens = {x for x in candidate_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
+        relevance = 0.0
+        if query_tokens:
+            relevance = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
+            if relevance < 0.2:
+                continue
         quality = probe_remote_quality(candidate, ydl, proxy=proxy, source_ip=source_ip)
         if quality is None:
             continue
         score = (
+            relevance,
             1 if quality.lossless else 0,
             quality.bitrate_kbps,
             quality.sample_rate or 0,
@@ -447,7 +477,7 @@ def build_query_from_message_text(message_text):
         for key in ("q", "query", "text", "title"):
             if key in parsed_qs and parsed_qs[key]:
                 candidate = re.sub(r"\s+", " ", unquote(parsed_qs[key][0])).strip()
-                if len(candidate) > 2:
+                if is_usable_query(candidate):
                     return candidate
         words = []
         for part in url.path_parts:
@@ -456,11 +486,55 @@ def build_query_from_message_text(message_text):
             part_norm = part.replace("-", " ").replace("_", " ")
             words.extend(re.findall(r"[A-Za-zА-Яа-я0-9]+", part_norm))
         words = [w for w in words if not w.isdigit()]
-        if words:
-            return " ".join(words[:10])
+        candidate = " ".join(words[:10])
+        if is_usable_query(candidate):
+            return candidate
     except Exception:
         pass
-    return re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
+    candidate = re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
+    if is_usable_query(candidate):
+        return candidate
+    return ""
+
+
+def is_usable_query(query):
+    """Return True if query has enough signal for cross-platform search."""
+    text = re.sub(r"\s+", " ", (query or "").strip().lower())
+    if len(text) < 4:
+        return False
+    tokens = re.findall(r"[a-zA-Zа-яА-Я0-9]+", text)
+    tokens = [x for x in tokens if len(x) > 1 and x not in QUERY_STOPWORDS]
+    return len(tokens) >= 2
+
+
+def extract_query_from_source_metadata(url, source_ip=None, proxy=None):
+    """Try to derive artist/title query from source metadata."""
+    ydl_opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "noplaylist": True,
+    }
+    if proxy:
+        ydl_opts["proxy"] = proxy
+    if source_ip:
+        ydl_opts["source_address"] = source_ip
+    try:
+        info = ydl.YoutubeDL(ydl_opts).extract_info(url, download=False)
+        if isinstance(info, dict) and info.get("entries"):
+            info = next((x for x in info["entries"] if isinstance(x, dict)), None)
+        if not isinstance(info, dict):
+            return ""
+    except Exception:
+        return ""
+    artist = info.get("artist") or info.get("uploader") or info.get("channel") or ""
+    title = info.get("track") or info.get("title") or ""
+    album = info.get("album") or ""
+    candidate = re.sub(r"\s+", " ", f"{artist} {title} {album}".strip())
+    if is_usable_query(candidate):
+        return candidate
+    return ""
 
 
 def format_quality_label(quality):
@@ -613,6 +687,8 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     wait_message_id = None
     message_text = (message.text or message.caption or "").strip()
     query_hint = build_query_from_message_text(message_text)
+    if not is_usable_query(query_hint):
+        query_hint = ""
     if action in ["dl", "link"]:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         wait_message = await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, parse_mode="Markdown", text=f"_{get_random_wait_text()}_")
@@ -697,7 +773,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                         "cookies_file": COOKIES_FILE,
                         "source_ip": source_ip,
                         "proxy": proxy,
-                        "query_hint": query_hint,
+                        "query_hint": (query_hint or extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)),
                     }
                     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
@@ -1392,7 +1468,11 @@ def download_url_and_send(
         # gc.collect()
 
     if status == "failed" and ENABLE_CROSS_PLATFORM_SEARCH and not download_video:
-        fallback_query = query_hint or build_query_from_message_text(url)
+        fallback_query = query_hint if is_usable_query(query_hint) else ""
+        if not fallback_query:
+            fallback_query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
+        if not fallback_query:
+            fallback_query = build_query_from_message_text(url)
         if fallback_query:
             better_source = find_better_source(
                 query=fallback_query,
