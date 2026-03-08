@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,37 +211,61 @@ def discover_platform_candidates(query: str, ydl_module: Any, max_candidates: in
     results: list[str] = []
     prefixes = YOUTUBE_FOCUSED_SEARCH_PREFIXES if prefer_youtube else DEFAULT_SEARCH_PREFIXES
     target_limit = max(max_candidates, 12) if prefer_youtube else max_candidates
+    if not prefixes:
+        return results
+    results_by_prefix: dict[str, list[str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(prefixes))) as pool:
+        future_map = {pool.submit(_search_prefix_candidates, prefix, query, ydl_module): prefix for prefix in prefixes}
+        for future in concurrent.futures.as_completed(future_map):
+            prefix = future_map[future]
+            try:
+                prefix_candidates = future.result()
+            except Exception:
+                prefix_candidates = []
+            results_by_prefix[prefix] = prefix_candidates
+    seen: set[str] = set()
     for prefix in prefixes:
-        search_url = f"{prefix}:{query}"
-        try:
-            info = ydl_module.YoutubeDL(
-                {
-                    "skip_download": True,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "ignoreerrors": True,
-                    "noplaylist": True,
-                    "logger": _YdlSilentLogger(),
-                }
-            ).extract_info(search_url, download=False)
-        except Exception:
-            continue
-        entries = info.get("entries") if isinstance(info, dict) else None
-        if not entries:
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict):
+        for candidate in results_by_prefix.get(prefix, []):
+            if candidate in seen:
                 continue
-            candidate = entry.get("webpage_url") or entry.get("url")
-            if candidate and not str(candidate).startswith("http"):
-                extractor = _safe_lower(str(entry.get("extractor_key") or entry.get("ie_key") or ""))
-                if extractor == "youtube" and re.fullmatch(r"[a-zA-Z0-9_-]{11}", str(candidate)):
-                    candidate = f"https://www.youtube.com/watch?v={candidate}"
-            if candidate and candidate.startswith("http"):
-                results.append(candidate)
+            seen.add(candidate)
+            results.append(candidate)
             if len(results) >= target_limit:
                 return results
     return results
+
+
+def _search_prefix_candidates(prefix: str, query: str, ydl_module: Any) -> list[str]:
+    """Run one yt-dlp search prefix and normalize URL candidates."""
+    search_url = f"{prefix}:{query}"
+    try:
+        info = ydl_module.YoutubeDL(
+            {
+                "skip_download": True,
+                "quiet": True,
+                "no_warnings": True,
+                "ignoreerrors": True,
+                "noplaylist": True,
+                "logger": _YdlSilentLogger(),
+            }
+        ).extract_info(search_url, download=False)
+    except Exception:
+        return []
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if not entries:
+        return []
+    candidates: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        candidate = entry.get("webpage_url") or entry.get("url")
+        if candidate and not str(candidate).startswith("http"):
+            extractor = _safe_lower(str(entry.get("extractor_key") or entry.get("ie_key") or ""))
+            if extractor == "youtube" and re.fullmatch(r"[a-zA-Z0-9_-]{11}", str(candidate)):
+                candidate = f"https://www.youtube.com/watch?v={candidate}"
+        if candidate and candidate.startswith("http"):
+            candidates.append(candidate)
+    return candidates
 
 
 def discover_web_candidates(query: str, max_candidates: int) -> list[str]:

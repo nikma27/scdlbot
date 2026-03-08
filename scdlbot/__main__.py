@@ -32,13 +32,14 @@ import sdnotify
 # import gc
 # from boltons.urlutils import find_all_links
 from fake_useragent import UserAgent
+from mutagen import File as MutagenFile
 from mutagen.id3 import ID3, ID3v1SaveOptions
 from mutagen.mp3 import EasyMP3 as MP3
 from pebble import ProcessPool, ThreadPool
 from telegram import Bot, BotCommand, Chat, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 
-# from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, TelegramError, TimedOut
+from telegram.error import TelegramError
 from telegram.ext import AIORateLimiter, Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, PicklePersistence, filters
 from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
@@ -318,6 +319,8 @@ QUERY_STOPWORDS = {
     "vk",
 }
 VK_AUDIO_ID_PATH_RE = re.compile(r"^audio\d+_\d+_[0-9a-f]+$", re.IGNORECASE)
+LOSSLESS_AUDIO_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
+SEARCH_CHOICE_CACHE_PREFIX = "search_choice:"
 
 
 # TODO get rid of these dumb exceptions:
@@ -529,11 +532,14 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
     """Search candidate links and rank by available audio quality."""
     query_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", query.lower()))
     query_tokens = {x for x in query_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
-    candidates = discover_platform_candidates(query, ydl, FALLBACK_MAX_CANDIDATES, prefer_youtube=True)
-    if ENABLE_WEB_FALLBACK:
-        candidates.extend(discover_web_candidates(query, FALLBACK_MAX_CANDIDATES))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as discover_pool:
+        platform_future = discover_pool.submit(discover_platform_candidates, query, ydl, FALLBACK_MAX_CANDIDATES, prefer_youtube=True)
+        web_future = discover_pool.submit(discover_web_candidates, query, FALLBACK_MAX_CANDIDATES) if ENABLE_WEB_FALLBACK else None
+        candidates = platform_future.result()
+        if web_future:
+            candidates.extend(web_future.result())
     seen = set()
-    ranked = []
+    prepared = []
     for candidate in candidates:
         if candidate in seen:
             continue
@@ -541,27 +547,39 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
         candidate_text = unquote(urlparse(candidate).path + " " + urlparse(candidate).query).lower()
         candidate_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", candidate_text))
         candidate_tokens = {x for x in candidate_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
-        relevance = 0.0
-        if query_tokens:
-            relevance = len(query_tokens & candidate_tokens) / max(1, len(query_tokens))
-        quality = probe_remote_quality(candidate, ydl, proxy=proxy, source_ip=source_ip)
-        if quality is None:
-            continue
-        title_relevance = compute_title_match_ratio(query, quality.title or candidate)
-        if title_relevance < 0.45:
-            continue
-        host = (URL(candidate).host or "").lower()
-        youtube_hd = 1 if (DOMAIN_YT in host or DOMAIN_YT_BE in host) and quality.max_video_height >= YOUTUBE_MIN_HEIGHT else 0
-        score = (
-            youtube_hd,
-            title_relevance,
-            relevance,
-            1 if quality.lossless else 0,
-            quality.bitrate_kbps,
-            quality.sample_rate or 0,
-            quality.max_video_height or 0,
-        )
-        ranked.append((score, candidate, quality))
+        relevance = len(query_tokens & candidate_tokens) / max(1, len(query_tokens)) if query_tokens else 0.0
+        prepared.append((candidate, relevance))
+    if not prepared:
+        return []
+    ranked = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(prepared))) as probe_pool:
+        future_map = {
+            probe_pool.submit(probe_remote_quality, candidate, ydl, proxy=proxy, source_ip=source_ip): (candidate, relevance)
+            for candidate, relevance in prepared
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            candidate, relevance = future_map[future]
+            try:
+                quality = future.result()
+            except Exception:
+                quality = None
+            if quality is None:
+                continue
+            title_relevance = compute_title_match_ratio(query, quality.title or candidate)
+            if title_relevance < 0.45:
+                continue
+            host = (URL(candidate).host or "").lower()
+            youtube_hd = 1 if (DOMAIN_YT in host or DOMAIN_YT_BE in host) and quality.max_video_height >= YOUTUBE_MIN_HEIGHT else 0
+            score = (
+                youtube_hd,
+                title_relevance,
+                relevance,
+                1 if quality.lossless else 0,
+                quality.bitrate_kbps,
+                quality.sample_rate or 0,
+                quality.max_video_height or 0,
+            )
+            ranked.append((score, candidate, quality))
     ranked.sort(key=lambda x: x[0], reverse=True)
     return [(url, quality) for _, url, quality in ranked[:SEARCH_RESULT_LIMIT]]
 
@@ -675,6 +693,111 @@ def format_quality_label(quality):
     return f"{bitrate} kbps"
 
 
+def get_source_name(host: str) -> str:
+    host = (host or "").lower()
+    if DOMAIN_YT in host or DOMAIN_YT_BE in host:
+        return "YouTube"
+    if DOMAIN_SC in host or DOMAIN_SC_GOOGL in host:
+        return "SoundCloud"
+    if DOMAIN_BC in host:
+        return "Bandcamp"
+    if DOMAIN_VK in host or DOMAIN_VK_RU in host:
+        return "VK"
+    if DOMAIN_TEXAMP in host:
+        return "Texamp"
+    return host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "") or "Источник"
+
+
+def format_search_choice_quality(quality):
+    quality_text = format_quality_label(quality)
+    if quality.max_video_height:
+        quality_text = f"{quality_text}, {quality.max_video_height}p"
+    if quality.extension and quality.extension != "unknown":
+        quality_text = f"{quality_text}, {quality.extension.upper()}"
+    return quality_text
+
+
+def get_search_choice_inline_keyboard(search_token: str, choices: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, choice in enumerate(choices):
+        button_text = f"{idx + 1}) {choice['source']} · {choice['quality']}"
+        rows.append([InlineKeyboardButton(text=button_text[:64], callback_data=f"search_choice {search_token} {idx}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"search_choice {search_token} cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _read_tag(tags, *keys):
+    if not tags:
+        return ""
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except Exception:
+            value = None
+        if not value:
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(x) for x in value if x)
+        value = str(value).strip()
+        if value:
+            return value
+    return ""
+
+
+def build_track_caption(file_path: str, host: str) -> str:
+    ext = pathlib.Path(file_path).suffix.lower().replace(".", "") or "unknown"
+    size_bytes = os.path.getsize(file_path)
+    size_mb = size_bytes / (1024 * 1024)
+    artist = ""
+    title = ""
+    album = ""
+    year = ""
+    genre = ""
+    bitrate = 0
+    sample_rate = 0
+    try:
+        mf_easy = MutagenFile(file_path, easy=True)
+        tags = getattr(mf_easy, "tags", None) if mf_easy else None
+        artist = _read_tag(tags, "artist", "albumartist")
+        title = _read_tag(tags, "title")
+        album = _read_tag(tags, "album")
+        year = _read_tag(tags, "date", "year")
+        genre = _read_tag(tags, "genre")
+    except Exception:
+        pass
+    try:
+        mf = MutagenFile(file_path)
+        info = getattr(mf, "info", None) if mf else None
+        if info:
+            bitrate = int(round(float(getattr(info, "bitrate", 0) or 0) / 1000.0))
+            sample_rate = int(getattr(info, "sample_rate", 0) or 0)
+    except Exception:
+        pass
+    if ext in LOSSLESS_AUDIO_EXTENSIONS:
+        quality = "lossless"
+    elif bitrate > 0:
+        quality = f"{bitrate} kbps"
+    else:
+        quality = "не определено"
+    if sample_rate:
+        quality = f"{quality}, {sample_rate} Hz"
+    lines = [
+        f"Источник: {get_source_name(host)}",
+        f"Исполнитель: {artist or 'не указан'}",
+        f"Трек: {title or 'не указан'}",
+        f"Альбом: {album or 'не указан'}",
+        f"Год: {year or 'не указан'}",
+        f"Жанр: {genre or 'не указан'}",
+        f"Качество: {quality}",
+        f"Формат: {ext.upper()}",
+        f"Вес: {size_mb:.2f} MB",
+    ]
+    caption = "\n".join(lines)
+    if len(caption) > 1020:
+        caption = caption[:1017] + "..."
+    return caption
+
+
 async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, command_name: str):
     """Execute unified search workflow and auto-download best source."""
     chat_id = update.effective_chat.id
@@ -715,33 +838,60 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
             text="Не нашёл подходящий трек на площадках и в быстром глобальном поиске. Попробуйте другой запрос или отправьте прямую ссылку.",
         )
         return
-    best_url, best_quality = results[0]
-    host = URL(best_url).host if best_url.startswith("http") else "unknown"
-    quality_label = format_quality_label(best_quality)
+    choices = []
+    for url_item, quality_item in results[:SEARCH_RESULT_LIMIT]:
+        host = URL(url_item).host if url_item.startswith("http") else "unknown"
+        choices.append(
+            {
+                "url": url_item,
+                "source": get_source_name(host),
+                "quality": format_search_choice_quality(quality_item),
+            }
+        )
+    if len(choices) == 1:
+        choice = choices[0]
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=wait_message.message_id,
+            text=f"✅ Нашёл вариант: {choice['source']} ({choice['quality']}). Скачиваю...",
+            disable_web_page_preview=True,
+        )
+        kwargs = {
+            "bot_options": {
+                "token": context.bot.token,
+                "base_url": context.bot.base_url.split("/bot")[0] + "/bot",
+                "base_file_url": context.bot.base_file_url.split("/file/bot")[0] + "/file/bot",
+                "local_mode": context.bot.local_mode,
+            },
+            "chat_id": chat_id,
+            "url": choice["url"],
+            "flood": context.chat_data["settings"]["flood"],
+            "reply_to_message_id": update.effective_message.message_id,
+            "wait_message_id": wait_message.message_id,
+            "cookies_file": COOKIES_FILE,
+            "source_ip": source_ip,
+            "proxy": proxy,
+            "query_hint": query,
+        }
+        schedule_download_task(kwargs)
+        return
+    search_token = uuid4().hex[:10]
+    search_cache_key = f"{SEARCH_CHOICE_CACHE_PREFIX}{search_token}"
+    context.chat_data[search_cache_key] = {
+        "choices": choices,
+        "source_ip": source_ip,
+        "proxy": proxy,
+        "query": query,
+        "reply_to_message_id": update.effective_message.message_id,
+    }
+    options_preview = "\n".join([f"{idx + 1}. {item['source']} — {item['quality']}" for idx, item in enumerate(choices)])
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=wait_message.message_id,
-        text=f"✅ Нашёл лучший вариант: {host} ({quality_label}). Скачиваю...",
+        text=f"🎧 Найдено несколько вариантов. Выберите качество:\n{options_preview}",
+        reply_markup=get_search_choice_inline_keyboard(search_token, choices),
         disable_web_page_preview=True,
     )
-    kwargs = {
-        "bot_options": {
-            "token": context.bot.token,
-            "base_url": context.bot.base_url.split("/bot")[0] + "/bot",
-            "base_file_url": context.bot.base_file_url.split("/file/bot")[0] + "/file/bot",
-            "local_mode": context.bot.local_mode,
-        },
-        "chat_id": chat_id,
-        "url": best_url,
-        "flood": context.chat_data["settings"]["flood"],
-        "reply_to_message_id": update.effective_message.message_id,
-        "wait_message_id": wait_message.message_id,
-        "cookies_file": COOKIES_FILE,
-        "source_ip": source_ip,
-        "proxy": proxy,
-        "query_hint": query,
-    }
-    schedule_download_task(kwargs)
 
 
 async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -950,12 +1100,63 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
     chat = update.effective_chat
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
-    # get message id and action from button data:
-    # TODO create separate callbacks by callback query data pattern
-    url_message_id, button_action = update.callback_query.data.split()
+    callback_data = (update.callback_query.data or "").strip()
+    callback_parts = callback_data.split()
+    if len(callback_parts) < 2:
+        await update.callback_query.answer(text=OLD_MSG_TEXT)
+        return
     if not chat_allowed(chat_id):
         await update.callback_query.answer(text="Команда недоступна в этом чате.")
         return
+    if callback_parts[0] == "search_choice":
+        search_token = callback_parts[1]
+        button_action = callback_parts[2] if len(callback_parts) >= 3 else "cancel"
+        search_cache_key = f"{SEARCH_CHOICE_CACHE_PREFIX}{search_token}"
+        search_data = context.chat_data.pop(search_cache_key, None)
+        if not search_data:
+            await update.callback_query.answer(text=OLD_MSG_TEXT)
+            await context.bot.delete_message(chat_id=chat_id, message_id=button_message_id)
+            return
+        if button_action == "cancel":
+            await update.callback_query.answer(text="Выбор отменён")
+            await update.callback_query.edit_message_text(text="Выбор варианта отменён.")
+            return
+        try:
+            selected_index = int(button_action)
+        except Exception:
+            selected_index = -1
+        choices = search_data.get("choices", [])
+        if selected_index < 0 or selected_index >= len(choices):
+            await update.callback_query.answer(text=OLD_MSG_TEXT)
+            await update.callback_query.edit_message_text(text="Вариант устарел, запустите поиск ещё раз.")
+            return
+        selected_choice = choices[selected_index]
+        await update.callback_query.answer(text=f"Выбрано: {selected_choice['quality']}")
+        await update.callback_query.edit_message_text(
+            text=f"✅ Выбран вариант: {selected_choice['source']} ({selected_choice['quality']}). Скачиваю..."
+        )
+        kwargs = {
+            "bot_options": {
+                "token": context.bot.token,
+                "base_url": context.bot.base_url.split("/bot")[0] + "/bot",
+                "base_file_url": context.bot.base_file_url.split("/file/bot")[0] + "/file/bot",
+                "local_mode": context.bot.local_mode,
+            },
+            "chat_id": chat_id,
+            "url": selected_choice["url"],
+            "flood": context.chat_data["settings"]["flood"],
+            "reply_to_message_id": search_data["reply_to_message_id"],
+            "wait_message_id": button_message_id,
+            "cookies_file": COOKIES_FILE,
+            "source_ip": search_data.get("source_ip"),
+            "proxy": search_data.get("proxy"),
+            "query_hint": search_data.get("query"),
+        }
+        schedule_download_task(kwargs)
+        return
+    # Legacy callback payloads: "<message_id> <action>".
+    url_message_id = callback_parts[0]
+    button_action = callback_parts[1]
     if url_message_id == "settings":
         # button on settings message:
         if chat_type != Chat.PRIVATE:
@@ -1658,7 +1859,6 @@ def download_url_and_send(
                     if ydl_download_audio_fallback(better_url, download_dir, source_ip=source_ip, proxy=proxy):
                         url = better_url
                         host = URL(url).host
-                        add_description += f"\n\nFallback source: {escape_markdown(better_url, version=1)}"
                         status = "success"
 
     if status == "failed":
@@ -1720,7 +1920,6 @@ def download_url_and_send(
                         url = better_url
                         host = URL(url).host
                         file_list = collect_downloaded_files(download_dir)
-                        add_description += f"\n\nQuality fallback source: {escape_markdown(better_url, version=1)}"
                     else:
                         logger.debug("Quality fallback download failed; keep original source files.")
 
@@ -1841,31 +2040,7 @@ def download_url_and_send(
                             parse_mode="Markdown",
                         )
                     )
-                caption = None
-                reply_to_message_id_send = None
-                if flood:
-                    addition = ""
-                    if DOMAIN_YT in host or DOMAIN_YT_BE in host:
-                        source = "YouTube"
-                        file_root, file_ext = os.path.splitext(file_name)
-                        file_title = file_root.replace(file_ext, "")
-                        addition = ": " + file_title
-                    elif DOMAIN_SC in host or DOMAIN_SC_GOOGL in host:
-                        source = "SoundCloud"
-                    elif DOMAIN_BC in host:
-                        source = "Bandcamp"
-                    elif DOMAIN_VK in host or DOMAIN_VK_RU in host:
-                        source = "VK"
-                    elif DOMAIN_TEXAMP in host:
-                        source = "Texamp"
-                    else:
-                        source = url_obj.host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "")
-                    # TODO fix youtube id in [] ?
-                    caption = "@{} _got it from_ [{}]({}){}".format(bot.username.replace("_", r"\_"), source, url, addition.replace("_", r"\_"))
-                    if add_description:
-                        caption += add_description
-                    # logger.debug(caption)
-                    reply_to_message_id_send = reply_to_message_id
+                reply_to_message_id_send = reply_to_message_id if flood else None
                 sent_audio_ids = []
                 for index, file_part in enumerate(file_parts):
                     path = pathlib.Path(file_part)
@@ -1876,16 +2051,13 @@ def download_url_and_send(
                     caption_part = None
                     if len(file_parts) > 1:
                         caption_part = "Part {} of {}".format(str(index + 1), str(len(file_parts)))
-                    if caption:
-                        if caption_part:
-                            caption_full = caption_part + " | " + caption
-                        else:
-                            caption_full = caption
-                    else:
-                        if caption_part:
-                            caption_full = caption_part
-                        else:
-                            caption_full = ""
+                    caption_full = build_track_caption(file_part, host)
+                    if download_video and add_description:
+                        description_clean = re.sub(r"\s+", " ", add_description).strip()
+                        if description_clean:
+                            caption_full = f"{caption_full}\nОписание: {description_clean[:300]}"
+                    if caption_part:
+                        caption_full = f"{caption_part}\n{caption_full}"
                     # caption_full = textwrap.shorten(caption_full, width=190, placeholder="..")
                     retries = 3
                     for i in range(retries):
@@ -1918,7 +2090,6 @@ def download_url_and_send(
                                         performer=performer,
                                         title=title,
                                         caption=caption_full,
-                                        parse_mode="Markdown",
                                         read_timeout=COMMON_CONNECTION_TIMEOUT,
                                         write_timeout=COMMON_CONNECTION_TIMEOUT,
                                         connect_timeout=COMMON_CONNECTION_TIMEOUT,
@@ -1944,7 +2115,6 @@ def download_url_and_send(
                                         width=width,
                                         height=height,
                                         caption=caption_full,
-                                        parse_mode="Markdown",
                                         read_timeout=COMMON_CONNECTION_TIMEOUT,
                                         write_timeout=COMMON_CONNECTION_TIMEOUT,
                                         connect_timeout=COMMON_CONNECTION_TIMEOUT,
