@@ -306,7 +306,7 @@ def get_random_wait_text():
 def get_link_text(urls):
     link_text = ""
     for i, url in enumerate(urls):
-        link_text += "[Source Link #{}]({}) | `{}`\n".format(str(i + 1), url, URL(url).host)
+        link_text += "[Ссылка на источник #{}]({}) | `{}`\n".format(str(i + 1), url, URL(url).host)
         # TODO split long link message to multiple ones
         direct_urls = urls[url].splitlines()[:3]
         for idx, direct_url in enumerate(direct_urls):
@@ -314,11 +314,11 @@ def get_link_text(urls):
                 content_type = ""
                 if "googlevideo" in direct_url:
                     if "audio" in direct_url:
-                        content_type = "Audio"
+                        content_type = "Аудио"
                     else:
-                        content_type = "Video"
-                link_text += "• {} #{} [Direct Link]({})\n".format(content_type, str(idx + 1), direct_url)
-    link_text += "\n*Note:* Final download URLs are only guaranteed to work on the same machine/IP where extracted"
+                        content_type = "Видео"
+                link_text += "• {} #{} [Прямая ссылка]({})\n".format(content_type, str(idx + 1), direct_url)
+    link_text += "\n*Примечание:* прямые ссылки обычно работают только с того же IP, где были получены."
     return link_text
 
 
@@ -331,14 +331,14 @@ def get_settings_inline_keyboard(chat_data):
     emoji_toggle_enabled = "✅"
     emoji_toggle_disabled = "❌"
     emoji_close = "❌"
-    button_dl = InlineKeyboardButton(text=" ".join([emoji_radio_selected if mode == "dl" else emoji_radio_unselected, "Download"]), callback_data=" ".join(["settings", "dl"]))
-    button_link = InlineKeyboardButton(text=" ".join([emoji_radio_selected if mode == "link" else emoji_radio_unselected, "Links"]), callback_data=" ".join(["settings", "link"]))
-    button_ask = InlineKeyboardButton(text=" ".join([emoji_radio_selected if mode == "ask" else emoji_radio_unselected, "Ask"]), callback_data=" ".join(["settings", "ask"]))
-    button_flood = InlineKeyboardButton(text=" ".join([emoji_toggle_enabled if flood else emoji_toggle_disabled, "Captions"]), callback_data=" ".join(["settings", "flood"]))
+    button_dl = InlineKeyboardButton(text=" ".join([emoji_radio_selected if mode == "dl" else emoji_radio_unselected, "Скачать"]), callback_data=" ".join(["settings", "dl"]))
+    button_link = InlineKeyboardButton(text=" ".join([emoji_radio_selected if mode == "link" else emoji_radio_unselected, "Ссылки"]), callback_data=" ".join(["settings", "link"]))
+    button_ask = InlineKeyboardButton(text=" ".join([emoji_radio_selected if mode == "ask" else emoji_radio_unselected, "Спросить"]), callback_data=" ".join(["settings", "ask"]))
+    button_flood = InlineKeyboardButton(text=" ".join([emoji_toggle_enabled if flood else emoji_toggle_disabled, "Подписи"]), callback_data=" ".join(["settings", "flood"]))
     button_allow_unknown_sites = InlineKeyboardButton(
-        text=" ".join([emoji_toggle_enabled if allow_unknown_sites else emoji_toggle_disabled, "Unknown sites"]), callback_data=" ".join(["settings", "allow_unknown_sites"])
+        text=" ".join([emoji_toggle_enabled if allow_unknown_sites else emoji_toggle_disabled, "Неизвестные сайты"]), callback_data=" ".join(["settings", "allow_unknown_sites"])
     )
-    button_close = InlineKeyboardButton(text=" ".join([emoji_close, "Close settings"]), callback_data=" ".join(["settings", "close"]))
+    button_close = InlineKeyboardButton(text=" ".join([emoji_close, "Закрыть настройки"]), callback_data=" ".join(["settings", "close"]))
     inline_keyboard = InlineKeyboardMarkup([[button_dl, button_link, button_ask], [button_allow_unknown_sites, button_flood], [button_close]])
     return inline_keyboard
 
@@ -428,44 +428,100 @@ def search_high_quality_sources(query, source_ip=None, proxy=None):
     return [(url, quality) for _, url, quality in ranked[:SEARCH_RESULT_LIMIT]]
 
 
-def format_search_result_text(query, results):
-    """Render plain-text search results for Telegram."""
-    if not results:
-        return (
-            "Ничего подходящего не найдено.\n\n"
-            "Попробуйте более точный запрос: `Исполнитель - Трек`.\n"
-            "Либо отправьте прямую ссылку на релиз/трек."
-        )
-    lines = [f"🔍 Search results for: {query}", ""]
-    for index, (url, quality) in enumerate(results, 1):
-        host = URL(url).host if url.startswith("http") else "unknown"
-        quality_label = "lossless" if quality.lossless else f"{int(quality.bitrate_kbps) if quality.bitrate_kbps else 0} kbps"
-        sr_label = f", {quality.sample_rate} Hz" if quality.sample_rate else ""
-        lines.append(f"{index}. {host} — {quality_label}{sr_label}")
-        lines.append(url)
-        lines.append("")
-    lines.append("Для скачивания отправьте нужную ссылку отдельным сообщением.")
-    return "\n".join(lines).strip()
+def build_query_from_message_text(message_text):
+    """Extract artist/title-like query from plain text or URL text."""
+    text = (message_text or "").strip()
+    if not text:
+        return ""
+    url_match = re.search(r"https?://\S+", text)
+    if not url_match:
+        return re.sub(r"\s+", " ", text)
+    url_text = url_match.group(0).rstrip(").,!?")
+    try:
+        url = URL(url_text)
+        words = []
+        for part in url.path_parts:
+            if not part:
+                continue
+            part_norm = part.replace("-", " ").replace("_", " ")
+            words.extend(re.findall(r"[A-Za-zА-Яа-я0-9]+", part_norm))
+        words = [w for w in words if not w.isdigit()]
+        if words:
+            return " ".join(words[:10])
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
+
+
+def format_quality_label(quality):
+    """Format quality line for user messages."""
+    if quality.lossless:
+        return "lossless"
+    bitrate = int(quality.bitrate_kbps) if quality.bitrate_kbps else 0
+    if quality.sample_rate:
+        return f"{bitrate} kbps, {quality.sample_rate} Hz"
+    return f"{bitrate} kbps"
 
 
 async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, command_name: str):
-    """Execute unified search workflow and send ranked results."""
+    """Execute unified search workflow and auto-download best source."""
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     if not chat_allowed(chat_id):
-        await context.bot.send_message(chat_id=chat_id, text="This command isn't allowed in this chat.")
+        await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
     if len(query.strip()) < 2:
         return
+    init_chat_data(
+        chat_data=context.chat_data,
+        mode=("dl" if chat_type == Chat.PRIVATE else "ask"),
+        flood=(chat_id not in NO_FLOOD_CHAT_IDS),
+    )
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     source_ip = random.choice(SOURCE_IPS) if SOURCE_IPS else None
     proxy = random.choice(PROXIES) if PROXIES else None
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    wait_message = await context.bot.send_message(
+        chat_id=chat_id,
+        reply_to_message_id=update.effective_message.message_id,
+        text="🔎 Ищу лучший источник и качество...",
+    )
     loop_main = asyncio.get_running_loop()
     results = await loop_main.run_in_executor(None, search_high_quality_sources, query, source_ip, proxy)
-    text = format_search_result_text(query, results)
-    await context.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True, reply_to_message_id=update.effective_message.message_id)
+    if not results:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=wait_message.message_id,
+            text="Не нашёл подходящий трек на площадках и в быстром глобальном поиске. Попробуйте другой запрос или отправьте прямую ссылку.",
+        )
+        return
+    best_url, best_quality = results[0]
+    host = URL(best_url).host if best_url.startswith("http") else "unknown"
+    quality_label = format_quality_label(best_quality)
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=wait_message.message_id,
+        text=f"✅ Нашёл лучший вариант: {host} ({quality_label}). Скачиваю...",
+        disable_web_page_preview=True,
+    )
+    kwargs = {
+        "bot_options": {
+            "token": context.bot.token,
+            "base_url": context.bot.base_url.split("/bot")[0] + "/bot",
+            "base_file_url": context.bot.base_file_url.split("/file/bot")[0] + "/file/bot",
+            "local_mode": context.bot.local_mode,
+        },
+        "chat_id": chat_id,
+        "url": best_url,
+        "flood": context.chat_data["settings"]["flood"],
+        "reply_to_message_id": update.effective_message.message_id,
+        "wait_message_id": wait_message.message_id,
+        "cookies_file": COOKIES_FILE,
+        "source_ip": source_ip,
+        "proxy": proxy,
+    }
+    EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
 
 
 async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,7 +529,7 @@ async def search_command_callback(update: Update, context: ContextTypes.DEFAULT_
     if not context.args:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Usage: /search <artist> <track>\n\nExample: /search Daft Punk One More Time",
+            text="Использование: /search <исполнитель> <трек>\nПример: /search Daft Punk One More Time",
         )
         return
     query = " ".join(context.args)
@@ -485,7 +541,7 @@ async def search_query_message_callback(update: Update, context: ContextTypes.DE
     message = update.effective_message
     if not message or not getattr(message, "text", None):
         return
-    query = message.text.strip()
+    query = build_query_from_message_text(message.text)
     await run_search_query(update, context, query, "search_msg")
 
 
@@ -498,7 +554,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     if not chat_allowed(chat_id):
-        await context.bot.send_message(chat_id=chat_id, text="This command isn't allowed in this chat.")
+        await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
     init_chat_data(
         chat_data=context.chat_data,
@@ -585,9 +641,18 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     # Continue only if any good direct url status exist (or if we deal with known sites):
     if action == "dl":
         if not urls_dict:
-            if apologize:
+            fallback_text = ""
+            if getattr(message, "text", None):
+                fallback_text = message.text
+            elif getattr(message, "caption", None):
+                fallback_text = message.caption
+            fallback_query = build_query_from_message_text(fallback_text)
+            if wait_message_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=wait_message_id)
+            if fallback_query:
+                await run_search_query(update, context, fallback_query, "search_fallback")
+            elif apologize:
                 await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=NO_URLS_TEXT, parse_mode="Markdown")
-            await context.bot.delete_message(chat_id=chat_id, message_id=wait_message_id)
         else:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             for url in urls_dict:
@@ -642,9 +707,9 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
         else:
             url_message_id = str(reply_to_message_id)
             context.chat_data[url_message_id] = {"urls": urls_dict, "source_ip": source_ip, "proxy": proxy}
-            question = "🎶 links found, what to do?"
-            button_dl = InlineKeyboardButton(text="⬇️ Download", callback_data=" ".join([url_message_id, "dl"]))
-            button_link = InlineKeyboardButton(text="🔗️ Get links", callback_data=" ".join([url_message_id, "link"]))
+            question = "🎶 Ссылки найдены. Что делаем?"
+            button_dl = InlineKeyboardButton(text="⬇️ Скачать", callback_data=" ".join([url_message_id, "dl"]))
+            button_link = InlineKeyboardButton(text="🔗️ Показать ссылки", callback_data=" ".join([url_message_id, "link"]))
             button_cancel = InlineKeyboardButton(text="❌", callback_data=" ".join([url_message_id, "cancel"]))
             inline_keyboard = InlineKeyboardMarkup([[button_dl, button_link, button_cancel]])
             await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, reply_markup=inline_keyboard, text=question)
@@ -661,7 +726,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
     # TODO create separate callbacks by callback query data pattern
     url_message_id, button_action = update.callback_query.data.split()
     if not chat_allowed(chat_id):
-        await update.callback_query.answer(text="This command isn't allowed in this chat.")
+        await update.callback_query.answer(text="Команда недоступна в этом чате.")
         return
     if url_message_id == "settings":
         # button on settings message:
@@ -670,7 +735,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
             # logger.debug(chat_member.status)
             if chat_member.status not in [ChatMember.OWNER, ChatMember.ADMINISTRATOR] and user_id != TG_BOT_OWNER_CHAT_ID:
                 logger.debug("settings_fail")
-                await update.callback_query.answer(text="You're not chat admin.")
+                await update.callback_query.answer(text="Вы не администратор чата.")
                 return
         command_name = f"settings_{button_action}"
         logger.debug(command_name)
@@ -691,10 +756,10 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 context.chat_data["settings"][button_action] = not current_setting
                 setting_changed = True
             if setting_changed:
-                await update.callback_query.answer(text="Settings changed")
+                await update.callback_query.answer(text="Настройки обновлены")
                 await update.callback_query.edit_message_reply_markup(reply_markup=get_settings_inline_keyboard(context.chat_data))
             else:
-                await update.callback_query.answer(text="Settings not changed")
+                await update.callback_query.answer(text="Настройки без изменений")
 
     elif url_message_id in context.chat_data:
         # mode is ask, we got data from button on asking message.
@@ -760,7 +825,7 @@ async def unknown_command_callback(update: Update, context: ContextTypes.DEFAULT
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         reply_to_message_id=message.message_id,
-        text="Unknown command.\nUse /search <artist> <track> or send plain text query.",
+        text="Неизвестная команда.\nИспользуйте /search <исполнитель> <трек> или отправьте обычный текстовый запрос.",
     )
 
 
