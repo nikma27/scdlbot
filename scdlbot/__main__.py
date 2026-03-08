@@ -255,6 +255,7 @@ REGION_RESTRICTION_TEXT = get_response_text("region_restriction.txt")
 DIRECT_RESTRICTION_TEXT = get_response_text("direct_restriction.txt")
 LIVE_RESTRICTION_TEXT = get_response_text("live_restriction.txt")
 OLD_MSG_TEXT = get_response_text("old_msg.txt")
+NOT_ADMIN_TEXT = get_response_text("not_admin.txt")
 # RANT_TEXT_PRIVATE = "Read /help to learn how to use me"
 # RANT_TEXT_PUBLIC = f"[Start me in PM to read help and learn how to use me](t.me/{TG_BOT_USERNAME}?start=1)"
 
