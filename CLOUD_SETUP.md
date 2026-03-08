@@ -32,3 +32,8 @@ Use this checklist to run `scdlbot`/`flacbot` only in cloud environments.
 
 - Keep major dependency upgrades (`scdl`, `doc8`) in separate PRs and validate bot behavior before rollout.
 - Keep `.env.cloud` out of git; commit only `.env.cloud.sample`.
+- Quality fallback controls for `scdlbot`:
+  - `QUALITY_MIN_BITRATE_KBPS` (default `320`)
+  - `PREFER_LOSSLESS` (`1` means try to upgrade lossy tracks)
+  - `ENABLE_CROSS_PLATFORM_SEARCH` and `ENABLE_WEB_FALLBACK`
+  - `FALLBACK_MAX_CANDIDATES` to cap probing cost.

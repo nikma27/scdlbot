@@ -40,6 +40,7 @@
 - The `lint` Makefile target is effectively a no-op (linters are commented out). Formatting is done via `make format` (isort + black).
 - `poetry` is installed to `~/.local/bin`; startup scripts should always export `PATH="$HOME/.local/bin:$PATH"` before running Poetry commands.
 - For production-like cloud verification without long-running process, use `make cloud_dry_run` with `CLOUD_DRY_RUN=1`.
+- Quality fallback can be tuned with `QUALITY_MIN_BITRATE_KBPS`, `PREFER_LOSSLESS`, `ENABLE_CROSS_PLATFORM_SEARCH`, and `ENABLE_WEB_FALLBACK`.
 
 ### Recommended cloud startup script
 

@@ -57,6 +57,12 @@ except ImportError:
 from boltons.urlutils import URL
 from plumbum import ProcessExecutionError, local
 
+from scdlbot.quality_fallback import (
+    build_query_from_local_tags,
+    find_better_source,
+    inspect_local_audio_quality,
+)
+
 # Use maximum 1500 mebibytes per task:
 # TODO Parametrize?
 MAX_MEM = 1500 * 1024 * 1024
@@ -106,6 +112,11 @@ CHECK_URL_TIMEOUT = int(os.getenv("CHECK_URL_TIMEOUT", 30))
 COMMON_CONNECTION_TIMEOUT = int(os.getenv("COMMON_CONNECTION_TIMEOUT", 10))
 MAX_TG_FILE_SIZE = int(os.getenv("MAX_TG_FILE_SIZE", "45_000_000"))
 MAX_CONVERT_FILE_SIZE = int(os.getenv("MAX_CONVERT_FILE_SIZE", "80_000_000"))
+QUALITY_MIN_BITRATE_KBPS = int(os.getenv("QUALITY_MIN_BITRATE_KBPS", "320"))
+PREFER_LOSSLESS = bool(int(os.getenv("PREFER_LOSSLESS", "1")))
+ENABLE_CROSS_PLATFORM_SEARCH = bool(int(os.getenv("ENABLE_CROSS_PLATFORM_SEARCH", "1")))
+ENABLE_WEB_FALLBACK = bool(int(os.getenv("ENABLE_WEB_FALLBACK", "1")))
+FALLBACK_MAX_CANDIDATES = int(os.getenv("FALLBACK_MAX_CANDIDATES", "8"))
 NO_FLOOD_CHAT_IDS = list(map(int, os.getenv("NO_FLOOD_CHAT_IDS", "0").split(",")))
 COOKIES_FILE = os.getenv("COOKIES_FILE", None)
 PROXIES = []
@@ -916,6 +927,48 @@ def ydl_get_direct_urls(url, cookies_file=None, source_ip=None, proxy=None):
     return status
 
 
+def collect_downloaded_files(download_dir):
+    """Collect downloaded files recursively."""
+    file_list = []
+    for directory, _, files in os.walk(download_dir):
+        for file in files:
+            file_list.append(os.path.join(directory, file))
+    return file_list
+
+
+def ydl_download_audio_fallback(url, download_dir, source_ip=None, proxy=None):
+    """Download audio-only URL using yt-dlp fallback options."""
+    ydl_opts = {
+        "outtmpl": os.path.join(download_dir, "%(title).16s [%(id)s].%(ext)s"),
+        "restrictfilenames": True,
+        "windowsfilenames": True,
+        "max_filesize": MAX_TG_FILE_SIZE * 3,
+        "format": "bestaudio/best",
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"},
+            {"key": "FFmpegMetadata"},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+        ],
+        "postprocessor_args": {
+            "ExtractAudio": ["-threads", "1"],
+            "extractaudio": ["-threads", "1"],
+        },
+        "writethumbnail": True,
+        "noplaylist": True,
+    }
+    if proxy:
+        ydl_opts["proxy"] = proxy
+    if source_ip:
+        ydl_opts["source_address"] = source_ip
+    try:
+        ydl.YoutubeDL(ydl_opts).download([url])
+        return True
+    except Exception:
+        logger.debug("ydl fallback download failed: %s", url)
+        logger.debug(traceback.format_exc())
+        return False
+
+
 def download_url_and_send(
     bot_options,
     chat_id,
@@ -1176,10 +1229,53 @@ def download_url_and_send(
     elif status == "timeout":
         run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=DL_TIMEOUT_TEXT, parse_mode="Markdown"))
     elif status == "success":
-        file_list = []
-        for d, dirs, files in os.walk(download_dir):
-            for file in files:
-                file_list.append(os.path.join(d, file))
+        file_list = collect_downloaded_files(download_dir)
+
+        # Try cross-platform quality fallback before sending low-quality results.
+        if file_list and ENABLE_CROSS_PLATFORM_SEARCH and not download_video:
+            audio_candidates = [x for x in file_list if os.path.splitext(x)[1].lower().replace(".", "") in AUDIO_FORMATS]
+            current_quality = inspect_local_audio_quality(audio_candidates)
+            should_search_better = False
+            if current_quality:
+                if current_quality.lossless:
+                    should_search_better = False
+                elif current_quality.bitrate_kbps < QUALITY_MIN_BITRATE_KBPS:
+                    should_search_better = True
+                elif PREFER_LOSSLESS:
+                    should_search_better = True
+            if should_search_better:
+                query = build_query_from_local_tags(audio_candidates)
+                if not query:
+                    query = url
+                better_source = find_better_source(
+                    query=query,
+                    current_quality=current_quality,
+                    ydl_module=ydl,
+                    min_bitrate_kbps=QUALITY_MIN_BITRATE_KBPS,
+                    prefer_lossless=PREFER_LOSSLESS,
+                    max_candidates=FALLBACK_MAX_CANDIDATES,
+                    web_fallback=ENABLE_WEB_FALLBACK,
+                    proxy=proxy,
+                    source_ip=source_ip,
+                )
+                if better_source:
+                    better_url, better_quality = better_source
+                    logger.info(
+                        "Quality fallback candidate selected: %s (lossless=%s, bitrate=%sk)",
+                        better_url,
+                        better_quality.lossless,
+                        better_quality.bitrate_kbps,
+                    )
+                    shutil.rmtree(download_dir, ignore_errors=True)
+                    os.makedirs(download_dir, exist_ok=True)
+                    if ydl_download_audio_fallback(better_url, download_dir, source_ip=source_ip, proxy=proxy):
+                        url = better_url
+                        host = URL(url).host
+                        file_list = collect_downloaded_files(download_dir)
+                        add_description += f"\n\nQuality fallback source: {escape_markdown(better_url, version=1)}"
+                    else:
+                        logger.debug("Quality fallback download failed; keep original source files.")
+
         if not file_list:
             logger.debug("No files in dir: %s", download_dir)
             run_async(
