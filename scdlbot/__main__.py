@@ -402,25 +402,47 @@ async def start_help_commands_callback(update: Update, context: ContextTypes.DEF
         message = update.channel_post
     elif update.message:
         message = update.message
+    if not message:
+        return
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     command_name = "help"
     # Determine the original command:
-    entities = message.parse_entities(types=[MessageEntity.BOT_COMMAND])
-    for entity_value in entities.values():
-        command_name = entity_value.replace("/", "").replace(f"@{context.bot.username}", "").lower()
-        break
+    try:
+        entities = message.parse_entities(types=[MessageEntity.BOT_COMMAND])
+        for entity_value in entities.values():
+            command_name = entity_value.replace("/", "").replace(f"@{context.bot.username}", "").lower()
+            break
+    except Exception:
+        command_name = "help"
     logger.info("received command: %s chat_id=%s", command_name, chat_id)
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     if command_name == "start":
-        # Plain text first to guarantee a visible quick response.
-        await context.bot.send_message(chat_id=chat_id, text=START_TEXT, disable_web_page_preview=True)
+        # Keep /start lightweight and plain text for maximum delivery reliability.
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text=f"{START_TEXT}\n\nНужна подробная инструкция: /help",
+            disable_web_page_preview=True,
+        )
+        return
     try:
-        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text=HELP_TEXT,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
     except Exception:
         # Fallback without markdown if Telegram rejects formatting.
-        await context.bot.send_message(chat_id=chat_id, text=HELP_TEXT, disable_web_page_preview=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id,
+            text=HELP_TEXT,
+            disable_web_page_preview=True,
+        )
 
 
 async def settings_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
