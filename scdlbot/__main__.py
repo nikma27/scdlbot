@@ -295,6 +295,7 @@ QUERY_STOPWORDS = {
     "вк",
     "vk",
 }
+VK_AUDIO_ID_PATH_RE = re.compile(r"^audio\d+_\d+_[0-9a-f]+$", re.IGNORECASE)
 
 
 # TODO get rid of these dumb exceptions:
@@ -482,16 +483,21 @@ def build_query_from_message_text(message_text):
     url_text = url_match.group(0).rstrip(").,!?")
     try:
         url = URL(url_text)
+        host = (url.host or "").lower()
         parsed_qs = parse_qs(urlparse(url_text).query)
         for key in ("q", "query", "text", "title"):
             if key in parsed_qs and parsed_qs[key]:
                 candidate = re.sub(r"\s+", " ", unquote(parsed_qs[key][0])).strip()
                 if is_usable_query(candidate):
                     return candidate
+        path_parts = [part for part in url.path_parts if part]
+        if (DOMAIN_VK in host or DOMAIN_VK_RU in host) and any(VK_AUDIO_ID_PATH_RE.fullmatch(part) for part in path_parts):
+            candidate = re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
+            if is_usable_query(candidate):
+                return candidate
+            return ""
         words = []
-        for part in url.path_parts:
-            if not part:
-                continue
+        for part in path_parts:
             part_norm = part.replace("-", " ").replace("_", " ")
             words.extend(re.findall(r"[A-Za-zА-Яа-я0-9]+", part_norm))
         words = [w for w in words if not w.isdigit()]
@@ -512,8 +518,27 @@ def is_usable_query(query):
     if len(text) < 4:
         return False
     tokens = re.findall(r"[a-zA-Zа-яА-Я0-9]+", text)
-    tokens = [x for x in tokens if len(x) > 1 and x not in QUERY_STOPWORDS]
-    return len(tokens) >= 2
+    normalized_tokens = []
+    for token in tokens:
+        if len(token) <= 1:
+            continue
+        token_lower = token.lower()
+        if token_lower in QUERY_STOPWORDS:
+            continue
+        if token_lower.isdigit():
+            continue
+        if re.fullmatch(r"[0-9a-f]{8,}", token_lower):
+            continue
+        if token_lower.startswith("audio") and any(char.isdigit() for char in token_lower):
+            continue
+        letters = len(re.findall(r"[a-zа-я]", token_lower))
+        digits = len(re.findall(r"\d", token_lower))
+        if letters < 2:
+            continue
+        if digits and len(token_lower) >= 10 and digits >= letters:
+            continue
+        normalized_tokens.append(token_lower)
+    return len(normalized_tokens) >= 2
 
 
 def extract_query_from_source_metadata(url, source_ip=None, proxy=None):
@@ -563,7 +588,14 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     if not chat_allowed(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
-    if len(query.strip()) < 2:
+    if not is_usable_query(query):
+        if command_name == "search_cmd":
+            await context.bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=update.effective_message.message_id,
+                text="Уточните запрос: `исполнитель трек`.\nПример: `/search Versalife Altered Perception`",
+                parse_mode="Markdown",
+            )
         return
     init_chat_data(
         chat_data=context.chat_data,
@@ -636,6 +668,9 @@ async def search_query_message_callback(update: Update, context: ContextTypes.DE
     if not message or not getattr(message, "text", None):
         return
     query = build_query_from_message_text(message.text)
+    if not is_usable_query(query):
+        # Ignore service-like messages (timestamps, single words, etc.).
+        return
     await run_search_query(update, context, query, "search_msg")
 
 
@@ -1273,6 +1308,7 @@ def download_url_and_send(
     host = url_obj.host
     download_video = False
     status = "initial"
+    vk_link_requires_text_query = False
     add_description = ""
     cmd = None
     cmd_name = ""
@@ -1482,6 +1518,10 @@ def download_url_and_send(
             fallback_query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
         if not fallback_query:
             fallback_query = build_query_from_message_text(url)
+        if not fallback_query and (DOMAIN_VK in host or DOMAIN_VK_RU in host):
+            path = (URL(url).path or "").lstrip("/")
+            if VK_AUDIO_ID_PATH_RE.fullmatch(path):
+                vk_link_requires_text_query = True
         if fallback_query:
             better_source = find_better_source(
                 query=fallback_query,
@@ -1512,7 +1552,13 @@ def download_url_and_send(
                         status = "success"
 
     if status == "failed":
-        run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=FAILED_TEXT, parse_mode="Markdown"))
+        failure_text = FAILED_TEXT
+        if vk_link_requires_text_query:
+            failure_text = (
+                "Не удалось извлечь название из этой VK-ссылки.\n"
+                "Отправьте рядом текст `исполнитель трек` или используйте `/search исполнитель трек`."
+            )
+        run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=failure_text, parse_mode="Markdown"))
     elif status == "timeout":
         run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=DL_TIMEOUT_TEXT, parse_mode="Markdown"))
     elif status == "success":
