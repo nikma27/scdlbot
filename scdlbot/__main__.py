@@ -36,7 +36,22 @@ from mutagen import File as MutagenFile
 from mutagen.id3 import ID3, ID3v1SaveOptions
 from mutagen.mp3 import EasyMP3 as MP3
 from pebble import ProcessPool, ThreadPool
-from telegram import Bot, BotCommand, Chat, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update
+from telegram import (
+    Bot,
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    Chat,
+    ChatMember,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    MessageEntity,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
 
 from telegram.error import TelegramError
@@ -327,6 +342,7 @@ BTN_SETTINGS = "⚙️ Настройки"
 BTN_SEARCH = "🔎 Поиск"
 BTN_DL = "⬇️ Скачать по ссылке"
 BTN_LINK = "🔗 Показать ссылки"
+BTN_START = "▶️ Старт"
 BTN_RESTART = "🔄 Перезапуск бота"
 
 
@@ -402,9 +418,9 @@ def get_settings_inline_keyboard(chat_data):
 
 def get_command_reply_keyboard(include_restart=False):
     rows = [
-        [KeyboardButton(BTN_HELP), KeyboardButton(BTN_SETTINGS)],
-        [KeyboardButton(BTN_SEARCH), KeyboardButton(BTN_DL)],
-        [KeyboardButton(BTN_LINK)],
+        [KeyboardButton(BTN_START), KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_SETTINGS), KeyboardButton(BTN_SEARCH)],
+        [KeyboardButton(BTN_DL), KeyboardButton(BTN_LINK)],
     ]
     if include_restart:
         rows.append([KeyboardButton(BTN_RESTART)])
@@ -522,8 +538,7 @@ async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT
         await context.bot.send_message(
             chat_id=chat_id,
             reply_to_message_id=message.message_id if message else None,
-            text=NOT_ADMIN_TEXT,
-            parse_mode="Markdown",
+            text="Перезапуск доступен только владельцу бота.",
         )
         return
     await context.bot.send_message(
@@ -861,6 +876,9 @@ async def handle_quick_button_message(update: Update, context: ContextTypes.DEFA
     """Handle Russian quick-action buttons from reply keyboard."""
     chat_id = update.effective_chat.id
     message = update.effective_message
+    if text == BTN_START:
+        await restart_command_callback(update, context)
+        return True
     if text == BTN_HELP:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -2311,7 +2329,17 @@ async def post_init(application: Application) -> None:
         BotCommand("restart", "Перезапуск (владелец)"),
     ]
     try:
-        await application.bot.set_my_commands(commands)
+        scopes = [
+            BotCommandScopeDefault(),
+            BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(),
+            BotCommandScopeAllChatAdministrators(),
+        ]
+        # Apply Russian command descriptions for all users/scopes.
+        for scope in scopes:
+            await application.bot.set_my_commands(commands, scope=scope)
+            await application.bot.set_my_commands(commands, scope=scope, language_code="ru")
+            await application.bot.set_my_commands(commands, scope=scope, language_code="en")
     except Exception:
         logger.warning("Could not set bot command menu", exc_info=True)
 
