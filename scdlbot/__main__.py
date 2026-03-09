@@ -703,6 +703,9 @@ def extract_query_from_source_metadata(url, source_ip=None, proxy=None):
     artist = info.get("artist") or info.get("uploader") or info.get("channel") or ""
     title = info.get("track") or info.get("title") or ""
     album = info.get("album") or ""
+    candidate = re.sub(r"\s+", " ", f"{artist} {title}".strip())
+    if is_usable_query(candidate):
+        return candidate
     candidate = re.sub(r"\s+", " ", f"{artist} {title} {album}".strip())
     if is_usable_query(candidate):
         return candidate
@@ -1963,6 +1966,11 @@ def download_url_and_send(
         # gc.collect()
 
     if status == "failed" and ENABLE_CROSS_PLATFORM_SEARCH and not download_video:
+        min_title_match = 0.55
+        if DOMAIN_BC in host:
+            min_title_match = 0.8
+        elif DOMAIN_VK in host or DOMAIN_VK_RU in host:
+            min_title_match = 0.7
         fallback_query = query_hint if is_usable_query(query_hint) else ""
         if not fallback_query:
             fallback_query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
@@ -1985,6 +1993,7 @@ def download_url_and_send(
                 source_ip=source_ip,
                 prefer_youtube=True,
                 youtube_min_height=YOUTUBE_MIN_HEIGHT,
+                min_title_match=min_title_match,
             )
             if better_source:
                 better_url, better_quality = better_source
@@ -2031,7 +2040,14 @@ def download_url_and_send(
                 elif PREFER_LOSSLESS:
                     should_search_better = True
             if should_search_better:
-                query = build_query_from_local_tags(audio_candidates)
+                min_title_match = 0.55
+                if DOMAIN_BC in host:
+                    min_title_match = 0.8
+                elif DOMAIN_VK in host or DOMAIN_VK_RU in host:
+                    min_title_match = 0.7
+                query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
+                if not query:
+                    query = build_query_from_local_tags(audio_candidates)
                 if not query:
                     query = url
                 better_source = find_better_source(
@@ -2046,6 +2062,7 @@ def download_url_and_send(
                     source_ip=source_ip,
                     prefer_youtube=True,
                     youtube_min_height=YOUTUBE_MIN_HEIGHT,
+                    min_title_match=min_title_match,
                 )
                 if better_source:
                     better_url, better_quality = better_source

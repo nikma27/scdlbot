@@ -151,6 +151,7 @@ def find_better_source(
     source_ip: str | None,
     prefer_youtube: bool = False,
     youtube_min_height: int = 1080,
+    min_title_match: float = 0.45,
 ) -> tuple[str, AudioQuality] | None:
     """Find better source URL by searching platforms, then web."""
     if not query:
@@ -175,7 +176,7 @@ def find_better_source(
         if not quality:
             continue
         title_match = compute_title_match_ratio(query, quality.title or candidate_url)
-        if _is_youtube_url(candidate_url) and title_match < 0.45:
+        if title_match < min_title_match:
             continue
         if prefer_youtube and _is_youtube_url(candidate_url) and quality.max_video_height and quality.max_video_height < youtube_min_height:
             continue
