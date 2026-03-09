@@ -1145,7 +1145,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
         #     loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, message, action, proxy, source_ip, allow_unknown_sites),
         #     timeout=CHECK_URL_TIMEOUT * 10,
         # )
-        urls_dict = await loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, CHECK_URL_TIMEOUT, message, action, proxy, source_ip, allow_unknown_sites)
+        urls_dict = await loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, message, action, proxy, source_ip, allow_unknown_sites)
     except asyncio.TimeoutError:
         logger.debug("get_direct_urls_dict took too much time and was dropped (but still running)")
     except Exception:
