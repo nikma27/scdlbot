@@ -3,7 +3,6 @@
 import asyncio
 import concurrent.futures
 import datetime
-import json
 import logging
 import os
 import pathlib
@@ -377,26 +376,6 @@ def get_random_wait_text():
     return random.choice(WAIT_BIT_TEXT)
 
 
-def agent_debug_log(hypothesis_id, location, message, data):
-    try:
-        with open("/opt/cursor/logs/debug.log", "a", encoding="utf-8") as debug_log:
-            debug_log.write(
-                json.dumps(
-                    {
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-
-
 def get_link_text(urls):
     link_text = ""
     for i, url in enumerate(urls):
@@ -643,14 +622,6 @@ def build_query_from_message_text(message_text):
         url = URL(url_text)
         host = (url.host or "").lower()
         parsed_qs = parse_qs(urlparse(url_text).query)
-        # region agent log
-        agent_debug_log(
-            "A",
-            "scdlbot/__main__.py:build_query_from_message_text",
-            "Parsed URL for fallback query extraction",
-            {"host": host, "path": (url.path or ""), "has_query": bool(parsed_qs)},
-        )
-        # endregion
         for key in ("q", "query", "text", "title"):
             if key in parsed_qs and parsed_qs[key]:
                 candidate = re.sub(r"\s+", " ", unquote(parsed_qs[key][0])).strip()
@@ -658,14 +629,6 @@ def build_query_from_message_text(message_text):
                     return candidate
         path_parts = [part for part in url.path_parts if part]
         vk_audio_part_match = (DOMAIN_VK in host or DOMAIN_VK_RU in host) and any(VK_AUDIO_ID_PATH_RE.fullmatch(part) for part in path_parts)
-        # region agent log
-        agent_debug_log(
-            "A",
-            "scdlbot/__main__.py:build_query_from_message_text",
-            "VK audio path_parts regex evaluation",
-            {"path_parts": path_parts, "vk_audio_part_match": vk_audio_part_match},
-        )
-        # endregion
         if vk_audio_part_match:
             candidate = re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
             if is_usable_query(candidate):
@@ -1801,14 +1764,6 @@ def download_url_and_send(
     cmd_name = ""
     cmd_args = ()
     cmd_input = None
-    # region agent log
-    agent_debug_log(
-        "B",
-        "scdlbot/__main__.py:download_url_and_send",
-        "Download started for URL",
-        {"url": url, "host": host, "query_hint_present": bool(query_hint)},
-    )
-    # endregion
     if ((DOMAIN_SC in host or DOMAIN_SC_GOOGL in host) and DOMAIN_SC_API not in host) or (DOMAIN_BC in host and BCDL_ENABLE):
         # If link is sc/bc, we try scdl/bcdl first:
         if (DOMAIN_SC in host or DOMAIN_SC_GOOGL in host) and DOMAIN_SC_API not in host:
@@ -2008,38 +1963,15 @@ def download_url_and_send(
         # gc.collect()
 
     if status == "failed" and ENABLE_CROSS_PLATFORM_SEARCH and not download_video:
-        # region agent log
-        agent_debug_log(
-            "C",
-            "scdlbot/__main__.py:download_url_and_send",
-            "Entered failed-status fallback branch",
-            {"status": status, "host": host, "download_video": download_video},
-        )
-        # endregion
         fallback_query = query_hint if is_usable_query(query_hint) else ""
         if not fallback_query:
             fallback_query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
         if not fallback_query:
             fallback_query = build_query_from_message_text(url)
-        vk_path_full_match = False
         if not fallback_query and (DOMAIN_VK in host or DOMAIN_VK_RU in host):
             path = (URL(url).path or "").lstrip("/")
-            vk_path_full_match = bool(VK_AUDIO_ID_PATH_RE.fullmatch(path))
-            if vk_path_full_match:
+            if VK_AUDIO_ID_PATH_RE.fullmatch(path):
                 vk_link_requires_text_query = True
-            # region agent log
-            agent_debug_log(
-                "D",
-                "scdlbot/__main__.py:download_url_and_send",
-                "VK failure fallback path regex evaluation",
-                {
-                    "path": path,
-                    "vk_path_full_match": vk_path_full_match,
-                    "fallback_query_present": bool(fallback_query),
-                    "vk_link_requires_text_query": vk_link_requires_text_query,
-                },
-            )
-            # endregion
         if fallback_query:
             better_source = find_better_source(
                 query=fallback_query,
@@ -2077,14 +2009,6 @@ def download_url_and_send(
                 "Не удалось извлечь название из этой VK-ссылки.\n"
                 "Отправьте рядом текст `исполнитель трек` или используйте `/search исполнитель трек`."
             )
-        # region agent log
-        agent_debug_log(
-            "E",
-            "scdlbot/__main__.py:download_url_and_send",
-            "Failure message selected",
-            {"vk_link_requires_text_query": vk_link_requires_text_query, "uses_default_failed_text": failure_text == FAILED_TEXT},
-        )
-        # endregion
         run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=failure_text, parse_mode="Markdown"))
     elif status == "timeout":
         run_async(bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=DL_TIMEOUT_TEXT, parse_mode="Markdown"))
