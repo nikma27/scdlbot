@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 from mutagen import File as MutagenFile
+
+logger = logging.getLogger(__name__)
 
 
 LOSSLESS_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
@@ -60,6 +63,11 @@ def _is_youtube_url(url: str) -> bool:
     return "youtube.com" in host or "youtu.be" in host
 
 
+def _safe_log_url(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
 def compute_title_match_ratio(query: str, candidate_title: str) -> float:
     """Return overlap ratio between query tokens and candidate title tokens."""
     query_tokens = _tokenize(query)
@@ -89,7 +97,7 @@ def inspect_local_audio_quality(file_paths: list[str]) -> AudioQuality | None:
                 sample_rate = getattr(mf.info, "sample_rate", None)
         except Exception:
             # Keep best-effort quality analysis; fallback should continue.
-            pass
+            logger.debug("inspect_local_audio_quality failed path=%s", path, exc_info=True)
 
         is_lossless = ext in LOSSLESS_EXTENSIONS
         candidate = AudioQuality(
@@ -114,6 +122,7 @@ def build_query_from_local_tags(file_paths: list[str]) -> str:
         try:
             mf = MutagenFile(path)
         except Exception:
+            logger.debug("build_query_from_local_tags failed path=%s", path, exc_info=True)
             mf = None
         if mf and getattr(mf, "tags", None):
             tags = mf.tags
@@ -226,6 +235,12 @@ def discover_platform_candidates(query: str, ydl_module: Any, max_candidates: in
             try:
                 prefix_candidates = future.result()
             except Exception:
+                logger.warning(
+                    "discover_platform_candidates failed prefix=%s query=%r",
+                    prefix,
+                    _clean_text(query)[:120],
+                    exc_info=True,
+                )
                 prefix_candidates = []
             results_by_prefix[prefix] = prefix_candidates
     seen: set[str] = set()
@@ -252,6 +267,12 @@ def discover_youtube_candidates(query: str, ydl_module: Any, max_candidates: int
             try:
                 by_prefix[prefix] = future.result()
             except Exception:
+                logger.warning(
+                    "discover_youtube_candidates failed prefix=%s query=%r",
+                    prefix,
+                    _clean_text(query)[:120],
+                    exc_info=True,
+                )
                 by_prefix[prefix] = []
     for prefix in YOUTUBE_ONLY_SEARCH_PREFIXES:
         for candidate in by_prefix.get(prefix, []):
@@ -281,6 +302,7 @@ def _search_prefix_candidates(prefix: str, query: str, ydl_module: Any) -> list[
             }
         ).extract_info(search_url, download=False)
     except Exception:
+        logger.debug("search prefix probe failed prefix=%s query=%r", prefix, _clean_text(query)[:120], exc_info=True)
         return []
     entries = info.get("entries") if isinstance(info, dict) else None
     if not entries:
@@ -307,6 +329,7 @@ def discover_web_candidates(query: str, max_candidates: int) -> list[str]:
         response = requests.get(search_url, timeout=8)
         response.raise_for_status()
     except Exception:
+        logger.warning("discover_web_candidates request failed query=%r", _clean_text(query)[:120], exc_info=True)
         return []
     hrefs = re.findall(r'href="([^"]+)"', response.text)
     urls: list[str] = []
@@ -359,6 +382,7 @@ def probe_remote_quality(
             if first:
                 info = first
     except Exception:
+        logger.debug("probe_remote_quality failed url=%s", _safe_log_url(url), exc_info=True)
         return None
 
     if not isinstance(info, dict):

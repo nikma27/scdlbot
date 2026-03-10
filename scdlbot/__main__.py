@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import asyncio
-import concurrent.futures
 import datetime
 import logging
 import os
@@ -21,7 +20,7 @@ from importlib import resources
 from logging.handlers import SysLogHandler
 from multiprocessing import get_context
 from subprocess import PIPE, TimeoutExpired  # skipcq: BAN-B404
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import urljoin
 from uuid import uuid4
 
 import ffmpeg
@@ -76,13 +75,17 @@ from plumbum import ProcessExecutionError, local
 
 from scdlbot.quality_fallback import (
     build_query_from_local_tags,
-    compute_title_match_ratio,
-    discover_platform_candidates,
-    discover_youtube_candidates,
-    discover_web_candidates,
     find_better_source,
     inspect_local_audio_quality,
-    probe_remote_quality,
+)
+from scdlbot.search_logic import (
+    VK_AUDIO_ID_PATH_RE,
+    build_query_from_message_text,
+    extract_query_from_source_metadata,
+    format_search_choice_quality,
+    get_quality_points,
+    is_usable_query,
+    search_high_quality_sources,
 )
 
 # Use maximum 1500 mebibytes per task:
@@ -315,28 +318,9 @@ DOMAINS = [rf"^(?:[^\s]+\.)?{re.escape(domain_string)}$" for domain_string in DO
 
 AUDIO_FORMATS = ["mp3"]
 VIDEO_FORMATS = ["m4a", "mp4", "webm"]
-QUERY_STOPWORDS = {
-    "audio",
-    "track",
-    "tracks",
-    "playlist",
-    "playlists",
-    "music",
-    "video",
-    "videos",
-    "listen",
-    "слушайте",
-    "слушать",
-    "музыка",
-    "трек",
-    "треки",
-    "плейлист",
-    "вк",
-    "vk",
-}
-VK_AUDIO_ID_PATH_RE = re.compile(r"^audio-?\d+_\d+_[0-9a-f]+$", re.IGNORECASE)
 LOSSLESS_AUDIO_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
 SEARCH_CHOICE_CACHE_PREFIX = "search_choice:"
+SEARCH_CHOICE_TTL_SECONDS = int(os.getenv("SEARCH_CHOICE_TTL_SECONDS", "900"))
 BTN_HELP = "❓ Помощь"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_SEARCH = "🔎 Поиск"
@@ -393,6 +377,109 @@ def get_link_text(urls):
                 link_text += "• {} #{} [Прямая ссылка]({})\n".format(content_type, str(idx + 1), direct_url)
     link_text += "\n*Примечание:* прямые ссылки обычно работают только с того же IP, где были получены."
     return link_text
+
+
+def _safe_log_url(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = URL(url)
+        return f"{parsed.scheme}://{parsed.host}{parsed.path}"
+    except Exception:
+        return str(url)[:160]
+
+
+def _safe_log_query(query: str | None) -> str:
+    return re.sub(r"\s+", " ", (query or "").strip())[:160]
+
+
+def log_pipeline_event(stage: str, **context):
+    """Log pipeline stage with compact structured context fields."""
+    fields = []
+    for key, value in context.items():
+        if value is None:
+            continue
+        if key in {"source_url", "selected_source", "url"}:
+            value = _safe_log_url(str(value))
+        elif key == "query":
+            value = _safe_log_query(str(value))
+        elif key in {"proxy", "cookies_file", "token"}:
+            value = "[redacted]"
+        fields.append(f"{key}={value}")
+    suffix = " ".join(fields)
+    if suffix:
+        logger.info("stage=%s %s", stage, suffix)
+    else:
+        logger.info("stage=%s", stage)
+
+
+async def safe_send_message(bot: Bot, *, stage: str, **kwargs):
+    """Send Telegram message with guarded error logging."""
+    try:
+        return await bot.send_message(**kwargs)
+    except TelegramError:
+        logger.warning(
+            "telegram_send_message_failed stage=%s chat_id=%s message_id=%s",
+            stage,
+            kwargs.get("chat_id"),
+            kwargs.get("reply_to_message_id"),
+            exc_info=True,
+        )
+        return None
+
+
+async def safe_edit_message_text(bot: Bot, *, stage: str, **kwargs):
+    """Edit Telegram message with guarded error logging."""
+    try:
+        return await bot.edit_message_text(**kwargs)
+    except TelegramError:
+        logger.warning(
+            "telegram_edit_message_failed stage=%s chat_id=%s message_id=%s",
+            stage,
+            kwargs.get("chat_id"),
+            kwargs.get("message_id"),
+            exc_info=True,
+        )
+        return None
+
+
+async def safe_delete_message(bot: Bot, *, stage: str, **kwargs):
+    """Delete Telegram message with guarded error logging."""
+    try:
+        return await bot.delete_message(**kwargs)
+    except TelegramError:
+        logger.warning(
+            "telegram_delete_message_failed stage=%s chat_id=%s message_id=%s",
+            stage,
+            kwargs.get("chat_id"),
+            kwargs.get("message_id"),
+            exc_info=True,
+        )
+        return None
+
+
+def is_search_choice_expired(search_data: dict | None, now: float | None = None) -> bool:
+    if not isinstance(search_data, dict):
+        return True
+    created_at = search_data.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return True
+    now_ts = now if now is not None else time.time()
+    return (now_ts - created_at) > SEARCH_CHOICE_TTL_SECONDS
+
+
+def cleanup_expired_search_choice_cache(chat_data: dict):
+    """Drop stale temporary choice entries from chat_data."""
+    now_ts = time.time()
+    removed = 0
+    for key in list(chat_data.keys()):
+        if not str(key).startswith(SEARCH_CHOICE_CACHE_PREFIX):
+            continue
+        if is_search_choice_expired(chat_data.get(key), now=now_ts):
+            chat_data.pop(key, None)
+            removed += 1
+    if removed:
+        logger.debug("search choice cache cleanup removed=%s", removed)
 
 
 def get_settings_inline_keyboard(chat_data):
@@ -550,168 +637,6 @@ async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT
     os.execv(sys.executable, [sys.executable, "-m", "scdlbot"])
 
 
-def search_high_quality_sources(query, source_ip=None, proxy=None):
-    """Search candidate links and rank by available audio quality."""
-    query_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", query.lower()))
-    query_tokens = {x for x in query_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as discover_pool:
-        youtube_future = discover_pool.submit(discover_youtube_candidates, query, ydl, FALLBACK_MAX_CANDIDATES)
-        platform_future = discover_pool.submit(discover_platform_candidates, query, ydl, FALLBACK_MAX_CANDIDATES, prefer_youtube=True)
-        web_future = discover_pool.submit(discover_web_candidates, query, FALLBACK_MAX_CANDIDATES) if ENABLE_WEB_FALLBACK else None
-        youtube_candidates = youtube_future.result()
-        platform_candidates = platform_future.result()
-        candidates = youtube_candidates + platform_candidates
-        if web_future:
-            candidates.extend(web_future.result())
-    seen = set()
-    prepared = []
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        candidate_text = unquote(urlparse(candidate).path + " " + urlparse(candidate).query).lower()
-        candidate_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", candidate_text))
-        candidate_tokens = {x for x in candidate_tokens if len(x) > 1 and x not in QUERY_STOPWORDS}
-        relevance = len(query_tokens & candidate_tokens) / max(1, len(query_tokens)) if query_tokens else 0.0
-        prepared.append((candidate, relevance))
-    if not prepared:
-        return []
-    ranked = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(prepared))) as probe_pool:
-        future_map = {
-            probe_pool.submit(probe_remote_quality, candidate, ydl, proxy=proxy, source_ip=source_ip): (candidate, relevance)
-            for candidate, relevance in prepared
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            candidate, relevance = future_map[future]
-            try:
-                quality = future.result()
-            except Exception:
-                quality = None
-            if quality is None:
-                continue
-            title_relevance = compute_title_match_ratio(query, quality.title or candidate)
-            if title_relevance < 0.45:
-                continue
-            host = (URL(candidate).host or "").lower()
-            youtube_hd = 1 if (DOMAIN_YT in host or DOMAIN_YT_BE in host) and quality.max_video_height >= YOUTUBE_MIN_HEIGHT else 0
-            score = (
-                youtube_hd,
-                title_relevance,
-                relevance,
-                1 if quality.lossless else 0,
-                quality.bitrate_kbps,
-                quality.sample_rate or 0,
-                quality.max_video_height or 0,
-            )
-            ranked.append((score, candidate, quality))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [(url, quality) for _, url, quality in ranked[:SEARCH_RESULT_LIMIT]]
-
-
-def build_query_from_message_text(message_text):
-    """Extract artist/title-like query from plain text or URL text."""
-    text = (message_text or "").strip()
-    if not text:
-        return ""
-    url_match = re.search(r"https?://\S+", text)
-    if not url_match:
-        return re.sub(r"\s+", " ", text)
-    url_text = url_match.group(0).rstrip(").,!?")
-    try:
-        url = URL(url_text)
-        host = (url.host or "").lower()
-        parsed_qs = parse_qs(urlparse(url_text).query)
-        for key in ("q", "query", "text", "title"):
-            if key in parsed_qs and parsed_qs[key]:
-                candidate = re.sub(r"\s+", " ", unquote(parsed_qs[key][0])).strip()
-                if is_usable_query(candidate):
-                    return candidate
-        path_parts = [part for part in url.path_parts if part]
-        vk_audio_part_match = (DOMAIN_VK in host or DOMAIN_VK_RU in host) and any(VK_AUDIO_ID_PATH_RE.fullmatch(part) for part in path_parts)
-        if vk_audio_part_match:
-            candidate = re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
-            if is_usable_query(candidate):
-                return candidate
-            return ""
-        words = []
-        for part in path_parts:
-            part_norm = part.replace("-", " ").replace("_", " ")
-            words.extend(re.findall(r"[A-Za-zА-Яа-я0-9]+", part_norm))
-        words = [w for w in words if not w.isdigit()]
-        candidate = " ".join(words[:10])
-        if is_usable_query(candidate):
-            return candidate
-    except Exception:
-        pass
-    candidate = re.sub(r"\s+", " ", text.replace(url_text, " ").strip())
-    if is_usable_query(candidate):
-        return candidate
-    return ""
-
-
-def is_usable_query(query):
-    """Return True if query has enough signal for cross-platform search."""
-    text = re.sub(r"\s+", " ", (query or "").strip().lower())
-    if len(text) < 4:
-        return False
-    tokens = re.findall(r"[a-zA-Zа-яА-Я0-9]+", text)
-    normalized_tokens = []
-    for token in tokens:
-        if len(token) <= 1:
-            continue
-        token_lower = token.lower()
-        if token_lower in QUERY_STOPWORDS:
-            continue
-        if token_lower.isdigit():
-            continue
-        if re.fullmatch(r"[0-9a-f]{8,}", token_lower):
-            continue
-        if token_lower.startswith("audio") and any(char.isdigit() for char in token_lower):
-            continue
-        letters = len(re.findall(r"[a-zа-я]", token_lower))
-        digits = len(re.findall(r"\d", token_lower))
-        if letters < 2:
-            continue
-        if digits and len(token_lower) >= 10 and digits >= letters:
-            continue
-        normalized_tokens.append(token_lower)
-    return len(normalized_tokens) >= 2
-
-
-def extract_query_from_source_metadata(url, source_ip=None, proxy=None):
-    """Try to derive artist/title query from source metadata."""
-    ydl_opts = {
-        "skip_download": True,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-        "noplaylist": True,
-    }
-    if proxy:
-        ydl_opts["proxy"] = proxy
-    if source_ip:
-        ydl_opts["source_address"] = source_ip
-    try:
-        info = ydl.YoutubeDL(ydl_opts).extract_info(url, download=False)
-        if isinstance(info, dict) and info.get("entries"):
-            info = next((x for x in info["entries"] if isinstance(x, dict)), None)
-        if not isinstance(info, dict):
-            return ""
-    except Exception:
-        return ""
-    artist = info.get("artist") or info.get("uploader") or info.get("channel") or ""
-    title = info.get("track") or info.get("title") or ""
-    album = info.get("album") or ""
-    candidate = re.sub(r"\s+", " ", f"{artist} {title}".strip())
-    if is_usable_query(candidate):
-        return candidate
-    candidate = re.sub(r"\s+", " ", f"{artist} {title} {album}".strip())
-    if is_usable_query(candidate):
-        return candidate
-    return ""
-
-
 def format_quality_label(quality):
     """Format quality line for user messages."""
     if quality.lossless:
@@ -735,32 +660,6 @@ def get_source_name(host: str) -> str:
     if DOMAIN_TEXAMP in host:
         return "Texamp"
     return host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "") or "Источник"
-
-
-def format_search_choice_quality(quality):
-    if quality.lossless:
-        base = "lossless"
-    else:
-        bitrate = int(quality.bitrate_kbps) if quality.bitrate_kbps else 0
-        base = f"{bitrate} kbps" if bitrate else "битрейт ?"
-    details = [base]
-    if quality.sample_rate:
-        details.append(f"{quality.sample_rate} Hz")
-    if quality.max_video_height:
-        details.append(f"{quality.max_video_height}p")
-    if quality.extension and quality.extension != "unknown":
-        details.append(quality.extension.upper())
-    return " · ".join(details)
-
-
-def get_quality_points(quality):
-    points = 0
-    if quality.lossless:
-        points += 1000
-    points += int(quality.bitrate_kbps or 0)
-    points += int((quality.sample_rate or 0) / 1000)
-    points += int((quality.max_video_height or 0) / 10)
-    return points
 
 
 def get_search_choice_inline_keyboard(search_token: str, choices: list[dict]) -> InlineKeyboardMarkup:
@@ -929,37 +828,77 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     """Execute unified search workflow and auto-download best source."""
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
+    user_id = update.effective_user.id if update.effective_user else 0
+    request_id = uuid4().hex[:8]
     if not chat_allowed(chat_id):
-        await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
+        await safe_send_message(context.bot, stage="search_not_allowed", chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
     if not is_usable_query(query):
         if command_name == "search_cmd":
-            await context.bot.send_message(
+            await safe_send_message(
+                context.bot,
+                stage="search_invalid_query",
                 chat_id=chat_id,
                 reply_to_message_id=update.effective_message.message_id,
                 text="Уточните запрос: `исполнитель трек`.\nПример: `/search Versalife Altered Perception`",
                 parse_mode="Markdown",
             )
         return
+    log_pipeline_event("search_start", request_id=request_id, chat_id=chat_id, user_id=user_id, query=query, command=command_name)
     init_chat_data(
         chat_data=context.chat_data,
         mode=("dl" if chat_type == Chat.PRIVATE else "ask"),
         flood=(chat_id not in NO_FLOOD_CHAT_IDS),
     )
+    cleanup_expired_search_choice_cache(context.chat_data)
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     source_ip = random.choice(SOURCE_IPS) if SOURCE_IPS else None
     proxy = random.choice(PROXIES) if PROXIES else None
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    wait_message = await context.bot.send_message(
+    wait_message = await safe_send_message(
+        context.bot,
+        stage="search_wait_message",
         chat_id=chat_id,
         reply_to_message_id=update.effective_message.message_id,
         text="🔎 Ищу лучший источник и качество...",
     )
+    if not wait_message:
+        return
     loop_main = asyncio.get_running_loop()
-    results = await loop_main.run_in_executor(None, search_high_quality_sources, query, source_ip, proxy)
+    search_runner = lambda: search_high_quality_sources(  # noqa: E731
+        query=query,
+        ydl_module=ydl,
+        fallback_max_candidates=FALLBACK_MAX_CANDIDATES,
+        search_result_limit=SEARCH_RESULT_LIMIT,
+        enable_web_fallback=ENABLE_WEB_FALLBACK,
+        youtube_min_height=YOUTUBE_MIN_HEIGHT,
+        source_ip=source_ip,
+        proxy=proxy,
+    )
+    try:
+        results = await loop_main.run_in_executor(None, search_runner)
+    except Exception:
+        logger.warning(
+            "search pipeline failed stage=rank chat_id=%s user_id=%s query=%s",
+            chat_id,
+            user_id,
+            _safe_log_query(query),
+            exc_info=True,
+        )
+        await safe_edit_message_text(
+            context.bot,
+            stage="search_rank_failed",
+            chat_id=chat_id,
+            message_id=wait_message.message_id,
+            text="Не удалось выполнить поиск сейчас. Попробуйте ещё раз через минуту.",
+        )
+        return
+    log_pipeline_event("search_ranked", request_id=request_id, chat_id=chat_id, user_id=user_id, query=query, result_count=len(results))
     if not results:
-        await context.bot.edit_message_text(
+        await safe_edit_message_text(
+            context.bot,
+            stage="search_no_results",
             chat_id=chat_id,
             message_id=wait_message.message_id,
             text="Не нашёл подходящий трек на площадках и в быстром глобальном поиске. Попробуйте другой запрос или отправьте прямую ссылку.",
@@ -984,11 +923,21 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         )
     if len(choices) == 1:
         choice = choices[0]
-        await context.bot.edit_message_text(
+        await safe_edit_message_text(
+            context.bot,
+            stage="search_single_choice",
             chat_id=chat_id,
             message_id=wait_message.message_id,
             text=f"✅ Нашёл вариант: {choice['source']} ({choice['quality']}). Скачиваю...",
             disable_web_page_preview=True,
+        )
+        log_pipeline_event(
+            "search_selected_auto",
+            request_id=request_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            query=query,
+            selected_source=choice["url"],
         )
         kwargs = {
             "bot_options": {
@@ -1017,6 +966,8 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         "proxy": proxy,
         "query": query,
         "reply_to_message_id": update.effective_message.message_id,
+        "created_at": time.time(),
+        "request_id": request_id,
     }
     options_preview = "\n".join(
         [
@@ -1025,7 +976,9 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
             for item in choices
         ]
     )
-    await context.bot.edit_message_text(
+    await safe_edit_message_text(
+        context.bot,
+        stage="search_show_choices",
         chat_id=chat_id,
         message_id=wait_message.message_id,
         text=f"🎧 Найдено несколько вариантов. Выберите лучший по качеству:\n{options_preview}",
@@ -1069,6 +1022,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
         message = update.message
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
+    user_id = update.effective_user.id if update.effective_user else 0
     if not chat_allowed(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
@@ -1103,8 +1057,10 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
         # rant_and_cleanup(context.bot, chat_id, rant_text, reply_to_message_id=reply_to_message_id)
         return
     command_name = f"{action}_cmd" if command_passed else f"{action}_msg"
+    request_id = uuid4().hex[:8]
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode=mode).inc()
+    log_pipeline_event("links_start", request_id=request_id, chat_id=chat_id, user_id=user_id, action=action)
     apologize = False
     # Apologize for fails: always in PM; only when it was explicit command in non-PM:
     if chat_type == Chat.PRIVATE or command_passed:
@@ -1123,8 +1079,15 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
         query_hint = ""
     if action in ["dl", "link"]:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        wait_message = await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, parse_mode="Markdown", text=f"_{get_random_wait_text()}_")
-        wait_message_id = wait_message.message_id
+        wait_message = await safe_send_message(
+            context.bot,
+            stage="links_wait_message",
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            parse_mode="Markdown",
+            text=f"_{get_random_wait_text()}_",
+        )
+        wait_message_id = wait_message.message_id if wait_message else None
 
     urls_dict = {}
 
@@ -1151,9 +1114,20 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
         # )
         urls_dict = await loop_main.run_in_executor(EXECUTOR, get_direct_urls_dict, message, action, proxy, source_ip, allow_unknown_sites)
     except asyncio.TimeoutError:
-        logger.debug("get_direct_urls_dict took too much time and was dropped (but still running)")
+        logger.warning(
+            "prepare_urls_timeout stage=get_direct_urls_dict chat_id=%s user_id=%s action=%s",
+            chat_id,
+            user_id,
+            action,
+        )
     except Exception:
-        logger.debug("get_direct_urls_dict failed for some unhandled reason")
+        logger.warning(
+            "prepare_urls_failed stage=get_direct_urls_dict chat_id=%s user_id=%s action=%s",
+            chat_id,
+            user_id,
+            action,
+            exc_info=True,
+        )
     # pool.shutdown(wait=False, cancel_futures=True)
 
     logger.debug(f"prepare_urls: urls dict: {urls_dict}")
@@ -1169,11 +1143,18 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                 fallback_text = message.caption
             fallback_query = build_query_from_message_text(fallback_text)
             if wait_message_id:
-                await context.bot.delete_message(chat_id=chat_id, message_id=wait_message_id)
+                await safe_delete_message(context.bot, stage="links_delete_wait_before_search_fallback", chat_id=chat_id, message_id=wait_message_id)
             if fallback_query:
                 await run_search_query(update, context, fallback_query, "search_fallback")
             elif apologize:
-                await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=NO_URLS_TEXT, parse_mode="Markdown")
+                await safe_send_message(
+                    context.bot,
+                    stage="links_no_urls",
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    text=NO_URLS_TEXT,
+                    parse_mode="Markdown",
+                )
         else:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             for url in urls_dict:
@@ -1205,7 +1186,15 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                         "cookies_file": COOKIES_FILE,
                         "source_ip": source_ip,
                         "proxy": proxy,
-                        "query_hint": (query_hint or extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)),
+                        "query_hint": (
+                            query_hint
+                            or extract_query_from_source_metadata(
+                                url,
+                                ydl_module=ydl,
+                                source_ip=source_ip,
+                                proxy=proxy,
+                            )
+                        ),
                     }
                     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
@@ -1215,13 +1204,23 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     elif action == "link":
         if "http" not in urls_values:
             if apologize:
-                await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=NO_URLS_TEXT, parse_mode="Markdown")
+                await safe_send_message(
+                    context.bot,
+                    stage="links_action_link_no_urls",
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    text=NO_URLS_TEXT,
+                    parse_mode="Markdown",
+                )
         else:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            await context.bot.send_message(
+            await safe_send_message(
+                context.bot,
+                stage="links_action_link_result",
                 chat_id=chat_id, reply_to_message_id=reply_to_message_id, parse_mode="Markdown", disable_web_page_preview=True, text=get_link_text(urls_dict)
             )
-        await context.bot.delete_message(chat_id=chat_id, message_id=wait_message_id)
+        if wait_message_id:
+            await safe_delete_message(context.bot, stage="links_action_link_delete_wait", chat_id=chat_id, message_id=wait_message_id)
     elif action == "ask":
         if "http" not in urls_values:
             if apologize:
@@ -1246,6 +1245,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
     chat_type = update.effective_chat.type
     callback_data = (update.callback_query.data or "").strip()
     callback_parts = callback_data.split()
+    cleanup_expired_search_choice_cache(context.chat_data)
     if len(callback_parts) < 2:
         await update.callback_query.answer(text=OLD_MSG_TEXT)
         return
@@ -1256,12 +1256,18 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
         search_token = callback_parts[1]
         button_action = callback_parts[2] if len(callback_parts) >= 3 else "cancel"
         search_cache_key = f"{SEARCH_CHOICE_CACHE_PREFIX}{search_token}"
-        search_data = context.chat_data.pop(search_cache_key, None)
+        search_data = context.chat_data.get(search_cache_key)
         if not search_data:
             await update.callback_query.answer(text=OLD_MSG_TEXT)
-            await context.bot.delete_message(chat_id=chat_id, message_id=button_message_id)
+            await safe_delete_message(context.bot, stage="search_choice_missing", chat_id=chat_id, message_id=button_message_id)
+            return
+        if is_search_choice_expired(search_data):
+            context.chat_data.pop(search_cache_key, None)
+            await update.callback_query.answer(text=OLD_MSG_TEXT)
+            await update.callback_query.edit_message_text(text="Вариант устарел, запустите поиск ещё раз.")
             return
         if button_action == "cancel":
+            context.chat_data.pop(search_cache_key, None)
             await update.callback_query.answer(text="Выбор отменён")
             await update.callback_query.edit_message_text(text="Выбор варианта отменён.")
             return
@@ -1274,7 +1280,16 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await update.callback_query.answer(text=OLD_MSG_TEXT)
             await update.callback_query.edit_message_text(text="Вариант устарел, запустите поиск ещё раз.")
             return
+        context.chat_data.pop(search_cache_key, None)
         selected_choice = choices[selected_index]
+        log_pipeline_event(
+            "search_choice_selected",
+            request_id=search_data.get("request_id"),
+            chat_id=chat_id,
+            user_id=user_id,
+            query=search_data.get("query"),
+            selected_source=selected_choice.get("url"),
+        )
         await update.callback_query.answer(text=f"Выбрано: {selected_choice['quality_short']}")
         await update.callback_query.edit_message_text(
             text=f"✅ Выбран вариант: {selected_choice['source']} ({selected_choice['quality_short']}). Скачиваю..."
@@ -1465,8 +1480,8 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
                 urls.append(url)
             else:
                 logger.info("Entity URL is not valid or blacklisted: %s", url_str)
-        except:
-            logger.info("Entity URL is not valid: %s", url_str)
+        except Exception:
+            logger.info("Entity URL is not valid: %s", url_str, exc_info=True)
     text_link_entities = message.parse_entities(types=[MessageEntity.TEXT_LINK])
     text_link_caption_entities = message.parse_caption_entities(types=[MessageEntity.TEXT_LINK])
     text_link_entities.update(text_link_caption_entities)
@@ -1504,7 +1519,8 @@ def get_direct_urls_dict(message, mode, proxy, source_ip, allow_unknown_sites):
                         # headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
                     ).url
                 )
-            except:
+            except Exception:
+                logger.debug("prepare_urls unshorten failed: %s", url_item, exc_info=True)
                 url = url_item
         else:
             url = url_item
@@ -1753,7 +1769,6 @@ def download_url_and_send(
         get_updates_request=HTTPXRequest(http_version=HTTP_VERSION),
     )
     run_async(bot.initialize())
-    logger.debug(bot.token)
     download_dir = os.path.join(DL_DIR, str(uuid4()))
     shutil.rmtree(download_dir, ignore_errors=True)
     os.makedirs(download_dir)
@@ -1909,9 +1924,8 @@ def download_url_and_send(
                     cookies_download_file.write(r.content)
                     cookies_download_file.close()
                     ydl_opts["cookiefile"] = str(cookies_download_file_path)
-                except:
-                    logger.debug("download_url_and_send could not download cookies file")
-                    pass
+                except Exception:
+                    logger.debug("download_url_and_send could not download cookies file", exc_info=True)
             elif cookies_file.startswith("firefox:"):
                 cookies_file_components = cookies_file.split(":", maxsplit=2)
                 if len(cookies_file_components) == 3:
@@ -1924,9 +1938,8 @@ def download_url_and_send(
                             cfile.write(r.content)
                         ydl_opts["cookiesfrombrowser"] = ("firefox", cookies_file_components[1], None, None)
                         logger.debug("download_url_and_send downloaded cookies.sqlite file")
-                    except:
-                        logger.debug("download_url_and_send could not download cookies.sqlite file")
-                        pass
+                    except Exception:
+                        logger.debug("download_url_and_send could not download cookies.sqlite file", exc_info=True)
                 else:
                     ydl_opts["cookiesfrombrowser"] = ("firefox", cookies_file_components[1], None, None)
             else:
@@ -1956,9 +1969,7 @@ def download_url_and_send(
                     unescaped_add_description += "\n" + info_dict["description"][:800]
                     add_description = escape_markdown(unescaped_add_description, version=1)
         except Exception as exc:
-            print(exc)
-            logger.debug("%s failed: %s", cmd_name, url)
-            logger.debug(traceback.format_exc())
+            logger.warning("%s failed: %s error=%s", cmd_name, _safe_log_url(url), exc, exc_info=True)
             status = "failed"
         if cookies_file:
             cookies_download_file.close()
@@ -1973,7 +1984,12 @@ def download_url_and_send(
             min_title_match = 0.7
         fallback_query = query_hint if is_usable_query(query_hint) else ""
         if not fallback_query:
-            fallback_query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
+            fallback_query = extract_query_from_source_metadata(
+                url,
+                ydl_module=ydl,
+                source_ip=source_ip,
+                proxy=proxy,
+            )
         if not fallback_query:
             fallback_query = build_query_from_message_text(url)
         if not fallback_query and (DOMAIN_VK in host or DOMAIN_VK_RU in host):
@@ -2045,7 +2061,12 @@ def download_url_and_send(
                     min_title_match = 0.8
                 elif DOMAIN_VK in host or DOMAIN_VK_RU in host:
                     min_title_match = 0.7
-                query = extract_query_from_source_metadata(url, source_ip=source_ip, proxy=proxy)
+                query = extract_query_from_source_metadata(
+                    url,
+                    ydl_module=ydl,
+                    source_ip=source_ip,
+                    proxy=proxy,
+                )
                 if not query:
                     query = build_query_from_local_tags(audio_candidates)
                 if not query:
@@ -2323,8 +2344,10 @@ def download_url_and_send(
                     message_id=wait_message_id,
                 ),
             )
-        except:
-            pass
+        except TelegramError:
+            logger.warning("worker delete wait message failed chat_id=%s message_id=%s", chat_id, wait_message_id, exc_info=True)
+        except Exception:
+            logger.warning("worker delete wait message failed unexpectedly chat_id=%s message_id=%s", chat_id, wait_message_id, exc_info=True)
     run_async(bot.shutdown())
 
 
