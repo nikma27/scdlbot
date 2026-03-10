@@ -149,13 +149,27 @@ def validate_runtime_config(parsed: Mapping[str, Any], env: Mapping[str, str] | 
         if value < 1 or value > 65535:
             result.errors.append(f"{port_key} must be in range 1..65535.")
 
-    chat_storage_parent = Path(str(parsed.get("CHAT_STORAGE", "/tmp/scdlbot.pickle"))).expanduser().parent
+    chat_storage_path = Path(str(parsed.get("CHAT_STORAGE", "/tmp/scdlbot.pickle"))).expanduser()
+    chat_storage_parent = chat_storage_path.parent
+    chat_storage_fallback_path = Path(str(parsed.get("CHAT_STORAGE_FALLBACK", "/tmp/scdlbot.pickle"))).expanduser()
+    chat_storage_fallback_parent = chat_storage_fallback_path.parent
     if not _check_writable_directory(chat_storage_parent):
-        result.errors.append(f"CHAT_STORAGE parent is not writable: {chat_storage_parent}")
+        if _check_writable_directory(chat_storage_fallback_parent):
+            result.warnings.append(
+                f"CHAT_STORAGE parent is not writable: {chat_storage_parent}; runtime will fallback to {chat_storage_fallback_path}"
+            )
+        else:
+            result.errors.append(
+                f"CHAT_STORAGE parent is not writable: {chat_storage_parent} and fallback is not writable: {chat_storage_fallback_parent}"
+            )
 
     dl_dir = Path(str(parsed.get("DL_DIR", "/tmp/scdlbot"))).expanduser()
+    dl_dir_fallback = Path(str(parsed.get("DL_DIR_FALLBACK", "/tmp/scdlbot"))).expanduser()
     if not _check_writable_directory(dl_dir):
-        result.errors.append(f"DL_DIR is not writable: {dl_dir}")
+        if _check_writable_directory(dl_dir_fallback):
+            result.warnings.append(f"DL_DIR is not writable: {dl_dir}; runtime will fallback to {dl_dir_fallback}")
+        else:
+            result.errors.append(f"DL_DIR is not writable: {dl_dir} and fallback is not writable: {dl_dir_fallback}")
 
     cookies_file = (parsed.get("COOKIES_FILE") or "").strip()
     if cookies_file and not cookies_file.startswith("http") and not cookies_file.startswith("firefox:"):
@@ -232,7 +246,9 @@ def _default_parsed_from_env(env: Mapping[str, str] | None = None) -> dict[str, 
         "TG_BOT_API": tg_api,
         "TG_BOT_API_LOCAL_MODE": tg_local,
         "CHAT_STORAGE": env_map.get("CHAT_STORAGE", "/tmp/scdlbot.pickle"),
+        "CHAT_STORAGE_FALLBACK": env_map.get("CHAT_STORAGE_FALLBACK", "/tmp/scdlbot.pickle"),
         "DL_DIR": env_map.get("DL_DIR", "/tmp/scdlbot"),
+        "DL_DIR_FALLBACK": env_map.get("DL_DIR_FALLBACK", "/tmp/scdlbot"),
         "WORKERS": _int("WORKERS", 2),
         "EXECUTOR_KIND": env_map.get("EXECUTOR_KIND", "thread"),
         "DL_TIMEOUT": _int("DL_TIMEOUT", 300),

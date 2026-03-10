@@ -84,6 +84,35 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertTrue(any("TG_BOT_TOKEN" in error for error in result.errors))
 
+    def test_validate_runtime_config_allows_tmp_fallback_for_storage(self):
+        parsed = {
+            "TG_BOT_TOKEN": "token",
+            "TG_BOT_API": "https://api.telegram.org",
+            "TG_BOT_API_LOCAL_MODE": False,
+            "CHAT_STORAGE": "/proc/forbidden/scdlbot.pickle",
+            "CHAT_STORAGE_FALLBACK": "/tmp/scdlbot_fallback.pickle",
+            "DL_DIR": "/proc/forbidden_dl",
+            "DL_DIR_FALLBACK": "/tmp/scdlbot_fallback_dl",
+            "WORKERS": 2,
+            "EXECUTOR_KIND": "thread",
+            "DL_TIMEOUT": 300,
+            "CHECK_URL_TIMEOUT": 30,
+            "COMMON_CONNECTION_TIMEOUT": 10,
+            "METRICS_PORT": 8000,
+            "HEALTHCHECK_ENABLE": False,
+            "HEALTHCHECK_PORT": 8080,
+            "WEBHOOK_ENABLE": False,
+            "WEBHOOK_APP_URL_ROOT": "",
+            "WEBHOOK_APP_URL_PATH": "",
+            "WEBHOOK_PORT": 5000,
+            "COOKIES_FILE": "",
+            "MAX_ACTIVE_JOBS_PER_CHAT": 4,
+            "MAX_GLOBAL_ACTIVE_JOBS": 8,
+        }
+        result = validate_runtime_config(parsed, env={"TG_BOT_TOKEN": "token"})
+        self.assertTrue(result.ok)
+        self.assertTrue(any("runtime will fallback" in warning for warning in result.warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

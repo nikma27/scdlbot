@@ -11,9 +11,20 @@
 - `BOT_MODE` (`scdlbot` или `flacbot`)
 - `WORKERS`, `EXECUTOR_KIND`
 - `DL_DIR`, `CHAT_STORAGE`
+- `DL_DIR_FALLBACK`, `CHAT_STORAGE_FALLBACK`
 - `LOGLEVEL`, `LOG_JSON`
 - `HEALTHCHECK_ENABLE`, `HEALTHCHECK_HOST`, `HEALTHCHECK_PORT`
 - `METRICS_HOST`, `METRICS_PORT`
+
+### Ephemeral cloud (без постоянного диска)
+
+- Поддерживается режим полностью во временном storage (`/tmp`).
+- Рекомендуемые значения:
+  - `CHAT_STORAGE=/tmp/scdlbot.pickle`
+  - `DL_DIR=/tmp/scdlbot`
+  - `CHAT_STORAGE_FALLBACK=/tmp/scdlbot.pickle`
+  - `DL_DIR_FALLBACK=/tmp/scdlbot`
+- В этом режиме нельзя рассчитывать на сохранение persistence после рестарта инстанса.
 
 ## 2) Рекомендуемая последовательность запуска
 
@@ -86,6 +97,7 @@ Prometheus:
 - `DL_DIR_MAX_FILE_COUNT` — лимит числа файлов (0 = выключено)
 
 Очистка выполняется на старте и в monitor callback.
+Для ephemeral среды рекомендуется держать `DL_DIR` в `/tmp` и ограничивать `TEMP_FILE_TTL_SECONDS`.
 
 ## 7) Операторские команды
 
@@ -140,7 +152,8 @@ Prometheus:
 3. Проверить health: `curl http://127.0.0.1:8080/healthz`
 
 Рекомендации:
-- Пробрасывайте persistent volume для `/var/lib/scdlbot` (там `DL_DIR` и `CHAT_STORAGE`).
+- Для долгоживущего self-hosted режима пробрасывайте persistent volume для `/var/lib/scdlbot`.
+- Для чисто ephemeral cloud режима persistent volume не обязателен; используйте `/tmp`.
 - Не запускайте второй контейнер с тем же токеном в polling-режиме.
 
 ## 10) systemd deployment (VPS)
@@ -151,7 +164,7 @@ Prometheus:
 Рекомендуемое размещение:
 - Код: `/opt/scdlbot`
 - Environment file: `/etc/scdlbot/scdlbot.env`
-- Persistent storage: `/var/lib/scdlbot/downloads`, `/var/lib/scdlbot/state`
+- Persistent storage (опционально): `/var/lib/scdlbot/downloads`, `/var/lib/scdlbot/state`
 
 Шаги:
 1. Скопировать unit-файл в `/etc/systemd/system/scdlbot.service`.

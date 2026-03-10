@@ -23,7 +23,7 @@ Run all commands from repository root (`/workspace` in Cursor Cloud).
 - env/config coherence (Python validator)
 - `ffmpeg` availability
 - downloader CLI presence (`yt-dlp`, `scdl`, `bandcamp-dl`)
-- writable storage paths from config
+- writable storage paths from config (with safe fallback to `/tmp` in ephemeral mode)
 
 ## 3) Run bot in cloud session
 
@@ -41,6 +41,8 @@ Run all commands from repository root (`/workspace` in Cursor Cloud).
 
 - Keep major dependency upgrades (`scdl`, `doc8`) in separate PRs and validate bot behavior before rollout.
 - Keep `.env.cloud` out of git; commit only `.env.cloud.sample`.
+- Ephemeral cloud mode is supported: `CHAT_STORAGE` and `DL_DIR` may safely point to `/tmp`.
+- In ephemeral mode, do not rely on persistence surviving restarts; settings/cache state can reset.
 - Detailed runtime workflow for search/download: `SEARCH_WORKFLOW.md`.
 - Operational runbook for health/restart/admission limits: `OPERATIONS.md`.
 - Docker/systemd deployment examples: `Dockerfile`, `deploy/docker-compose.example.yml`, `deploy/scdlbot.service`.
