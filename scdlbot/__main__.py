@@ -82,7 +82,9 @@ from scdlbot.search_logic import (
     VK_AUDIO_ID_PATH_RE,
     build_query_from_message_text,
     extract_query_from_source_metadata,
+    format_quality_label,
     format_search_choice_quality,
+    get_source_name,
     get_quality_points,
     is_usable_query,
     search_high_quality_sources,
@@ -468,7 +470,7 @@ def is_search_choice_expired(search_data: dict | None, now: float | None = None)
     return (now_ts - created_at) > SEARCH_CHOICE_TTL_SECONDS
 
 
-def cleanup_expired_search_choice_cache(chat_data: dict):
+def cleanup_expired_search_choice_cache(chat_data: dict, *, chat_id: int | None = None, user_id: int | None = None):
     """Drop stale temporary choice entries from chat_data."""
     now_ts = time.time()
     removed = 0
@@ -479,7 +481,12 @@ def cleanup_expired_search_choice_cache(chat_data: dict):
             chat_data.pop(key, None)
             removed += 1
     if removed:
-        logger.debug("search choice cache cleanup removed=%s", removed)
+        log_pipeline_event(
+            "search_choice_expired_cleanup",
+            chat_id=chat_id,
+            user_id=user_id,
+            removed=removed,
+        )
 
 
 def get_settings_inline_keyboard(chat_data):
@@ -635,31 +642,6 @@ async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT
     )
     await asyncio.sleep(0.2)
     os.execv(sys.executable, [sys.executable, "-m", "scdlbot"])
-
-
-def format_quality_label(quality):
-    """Format quality line for user messages."""
-    if quality.lossless:
-        return "lossless"
-    bitrate = int(quality.bitrate_kbps) if quality.bitrate_kbps else 0
-    if quality.sample_rate:
-        return f"{bitrate} kbps, {quality.sample_rate} Hz"
-    return f"{bitrate} kbps"
-
-
-def get_source_name(host: str) -> str:
-    host = (host or "").lower()
-    if DOMAIN_YT in host or DOMAIN_YT_BE in host:
-        return "Ютуб"
-    if DOMAIN_SC in host or DOMAIN_SC_GOOGL in host:
-        return "Саундклауд"
-    if DOMAIN_BC in host:
-        return "Бэндкэмп"
-    if DOMAIN_VK in host or DOMAIN_VK_RU in host:
-        return "ВК"
-    if DOMAIN_TEXAMP in host:
-        return "Texamp"
-    return host.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "") or "Источник"
 
 
 def get_search_choice_inline_keyboard(search_token: str, choices: list[dict]) -> InlineKeyboardMarkup:
@@ -850,7 +832,7 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         mode=("dl" if chat_type == Chat.PRIVATE else "ask"),
         flood=(chat_id not in NO_FLOOD_CHAT_IDS),
     )
-    cleanup_expired_search_choice_cache(context.chat_data)
+    cleanup_expired_search_choice_cache(context.chat_data, chat_id=chat_id, user_id=user_id)
     logger.debug(command_name)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     source_ip = random.choice(SOURCE_IPS) if SOURCE_IPS else None
@@ -969,6 +951,14 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         "created_at": time.time(),
         "request_id": request_id,
     }
+    log_pipeline_event(
+        "search_choice_created",
+        request_id=request_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        query=query,
+        result_count=len(choices),
+    )
     options_preview = "\n".join(
         [
             f"{item['rank']}. {item['source']} — {item['quality']} (оценка {item['points']})"
@@ -1245,7 +1235,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
     chat_type = update.effective_chat.type
     callback_data = (update.callback_query.data or "").strip()
     callback_parts = callback_data.split()
-    cleanup_expired_search_choice_cache(context.chat_data)
+    cleanup_expired_search_choice_cache(context.chat_data, chat_id=chat_id, user_id=user_id)
     if len(callback_parts) < 2:
         await update.callback_query.answer(text=OLD_MSG_TEXT)
         return
@@ -1263,6 +1253,13 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return
         if is_search_choice_expired(search_data):
             context.chat_data.pop(search_cache_key, None)
+            log_pipeline_event(
+                "search_choice_expired",
+                request_id=search_data.get("request_id"),
+                chat_id=chat_id,
+                user_id=user_id,
+                query=search_data.get("query"),
+            )
             await update.callback_query.answer(text=OLD_MSG_TEXT)
             await update.callback_query.edit_message_text(text="Вариант устарел, запустите поиск ещё раз.")
             return
@@ -2020,6 +2017,13 @@ def download_url_and_send(
                         better_quality.lossless,
                         better_quality.bitrate_kbps,
                     )
+                    log_pipeline_event(
+                        "download_failure_fallback_selected",
+                        chat_id=chat_id,
+                        query=fallback_query,
+                        source_url=url,
+                        selected_source=better_url,
+                    )
                     shutil.rmtree(download_dir, ignore_errors=True)
                     os.makedirs(download_dir, exist_ok=True)
                     if ydl_download_audio_fallback(better_url, download_dir, source_ip=source_ip, proxy=proxy):
@@ -2092,6 +2096,13 @@ def download_url_and_send(
                         better_url,
                         better_quality.lossless,
                         better_quality.bitrate_kbps,
+                    )
+                    log_pipeline_event(
+                        "download_quality_fallback_selected",
+                        chat_id=chat_id,
+                        query=query,
+                        source_url=url,
+                        selected_source=better_url,
                     )
                     shutil.rmtree(download_dir, ignore_errors=True)
                     os.makedirs(download_dir, exist_ok=True)

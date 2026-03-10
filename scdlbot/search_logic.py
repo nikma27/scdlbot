@@ -205,6 +205,7 @@ def search_high_quality_sources(
                 candidates.extend(future.result())
             except Exception:
                 logger.warning("candidate discovery failed stage=%s query=%r", source_name, _sanitize_query_text(query)[:120], exc_info=True)
+    logger.info("search_discovery_complete query=%r candidate_count=%s", _sanitize_query_text(query)[:120], len(candidates))
 
     seen = set()
     prepared = []
@@ -261,6 +262,7 @@ def search_high_quality_sources(
             ranked.append((score, candidate, quality))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
+    logger.info("search_probe_complete query=%r prepared_count=%s ranked_count=%s", _sanitize_query_text(query)[:120], len(prepared), len(ranked))
     return [(url, quality) for _, url, quality in ranked[:search_result_limit]]
 
 
@@ -279,6 +281,32 @@ def format_search_choice_quality(quality: AudioQuality) -> str:
     if quality.extension and quality.extension != "unknown":
         details.append(quality.extension.upper())
     return " · ".join(details)
+
+
+def format_quality_label(quality: AudioQuality) -> str:
+    """Format compact quality label for user-visible messages."""
+    if quality.lossless:
+        return "lossless"
+    bitrate = int(quality.bitrate_kbps) if quality.bitrate_kbps else 0
+    if quality.sample_rate:
+        return f"{bitrate} kbps, {quality.sample_rate} Hz"
+    return f"{bitrate} kbps"
+
+
+def get_source_name(host: str) -> str:
+    """Convert source host to a short Russian display name."""
+    host_norm = (host or "").strip().lower()
+    if "youtube.com" in host_norm or "youtu.be" in host_norm:
+        return "Ютуб"
+    if "soundcloud.com" in host_norm or "soundcloud.app.goo.gl" in host_norm:
+        return "Саундклауд"
+    if "bandcamp.com" in host_norm:
+        return "Бэндкэмп"
+    if "vk.com" in host_norm or "vk.ru" in host_norm:
+        return "ВК"
+    if "texamp.com" in host_norm:
+        return "Texamp"
+    return host_norm.replace(".com", "").replace(".ru", "").replace("www.", "").replace("m.", "") or "Источник"
 
 
 def get_quality_points(quality: AudioQuality) -> int:
