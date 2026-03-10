@@ -52,6 +52,11 @@ preflight:
 smoke_test:
 	poetry run python -m unittest discover -s tests -p "test_*.py"
 
+.PHONY: test_search_logic
+test_search_logic:
+	poetry run python -m unittest discover -s tests -p "test_search_logic.py"
+	poetry run python -m unittest discover -s tests -p "test_quality_fallback_helpers.py"
+
 .PHONY: ci
 ci:
 	poetry run python -m py_compile scdlbot/__main__.py scdlbot/quality_fallback.py scdlbot/search_logic.py scdlbot/runtime_ops.py scdlbot/runtime_limits.py scdlbot/config_validation.py
