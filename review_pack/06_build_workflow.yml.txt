@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.13']
+
+    steps:
+    - uses: actions/checkout@v4.2.2
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5.6.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Display Python version
+      run: python -c "import sys; print(sys.version)"
+
+    - name: Install Poetry
+      run: |
+        pip install --upgrade pip
+        pip install --upgrade poetry
+        poetry --version
+
+    - name: Install dependencies
+      run: |
+        poetry install --with main,dev,flacbot --sync
+
+    - name: Run CI smoke checks
+      env:
+        TG_BOT_TOKEN: "dummy_token_for_ci"
+      run: |
+        make ci
