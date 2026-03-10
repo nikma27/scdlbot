@@ -5,7 +5,6 @@ import datetime
 import logging
 import os
 import pathlib
-import pickle
 import platform
 import random
 import re
@@ -79,6 +78,14 @@ from scdlbot.quality_fallback import (
     inspect_local_audio_quality,
 )
 from scdlbot.config_validation import sanitize_mapping_for_log, validate_runtime_config
+from scdlbot.persistence_hygiene import (
+    PERSISTENCE_VERSION_KEY,
+    cleanup_chat_data_ephemeral,
+    get_storage_file_info,
+    infer_persistence_version,
+    inspect_persistence_state,
+    prepare_persistence_file,
+)
 from scdlbot.runtime_ops import (
     JsonLogFormatter,
     RuntimeState,
@@ -346,6 +353,7 @@ logger = logging.getLogger(__name__)
 RUNTIME_STATE = RuntimeState()
 RUNTIME_ADMISSION = RuntimeAdmission()
 HEALTHCHECK_SERVER = None
+PERSISTENCE_STARTUP_SUMMARY: dict[str, object] = {}
 POST_SHUTDOWN_DONE = False
 POST_SHUTDOWN_LOCK = threading.Lock()
 
@@ -423,6 +431,7 @@ VIDEO_FORMATS = ["m4a", "mp4", "webm"]
 LOSSLESS_AUDIO_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
 SEARCH_CHOICE_CACHE_PREFIX = "search_choice:"
 SEARCH_CHOICE_TTL_SECONDS = _env_int("SEARCH_CHOICE_TTL_SECONDS", 900)
+PERSISTENCE_EPHEMERAL_TTL_SECONDS = _env_int("PERSISTENCE_EPHEMERAL_TTL_SECONDS", 3600)
 BTN_HELP = "❓ Помощь"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_SEARCH = "🔎 Поиск"
@@ -637,21 +646,23 @@ def is_search_choice_expired(search_data: dict | None, now: float | None = None)
 
 
 def cleanup_expired_search_choice_cache(chat_data: dict, *, chat_id: int | None = None, user_id: int | None = None):
-    """Drop stale temporary choice entries from chat_data."""
-    now_ts = time.time()
-    removed = 0
-    for key in list(chat_data.keys()):
-        if not str(key).startswith(SEARCH_CHOICE_CACHE_PREFIX):
-            continue
-        if is_search_choice_expired(chat_data.get(key), now=now_ts):
-            chat_data.pop(key, None)
-            removed += 1
-    if removed:
+    """Drop stale temporary entries from chat_data."""
+    cleanup_summary = cleanup_chat_data_ephemeral(
+        chat_data,
+        now_ts=time.time(),
+        search_choice_ttl_seconds=SEARCH_CHOICE_TTL_SECONDS,
+        ephemeral_request_ttl_seconds=PERSISTENCE_EPHEMERAL_TTL_SECONDS,
+        dry_run=False,
+    )
+    removed = int(cleanup_summary.get("search_choice_removed", 0) + cleanup_summary.get("ephemeral_request_removed", 0))
+    if removed > 0:
         log_pipeline_event(
             "search_choice_expired_cleanup",
             chat_id=chat_id,
             user_id=user_id,
             removed=removed,
+            search_choice_removed=cleanup_summary.get("search_choice_removed", 0),
+            ephemeral_removed=cleanup_summary.get("ephemeral_request_removed", 0),
         )
 
 
@@ -910,6 +921,147 @@ def _format_runtime_ts(value: float) -> str:
 
 def _runtime_mode() -> str:
     return "webhook" if WEBHOOK_ENABLE else "polling"
+
+
+def _format_size_bytes(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KiB"
+    return f"{size_bytes / (1024 * 1024):.2f} MiB"
+
+
+async def _owner_only_command_guard(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    stage: str,
+) -> bool:
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id == TG_BOT_OWNER_CHAT_ID:
+        return True
+    await safe_send_message(
+        context.bot,
+        stage=stage,
+        chat_id=chat_id,
+        reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+        text="Команда доступна только владельцу бота.",
+    )
+    return False
+
+
+async def _flush_application_persistence(application: Application) -> None:
+    try:
+        await application.update_persistence()
+    except Exception:
+        logger.warning("application.update_persistence failed", exc_info=True)
+    persistence = getattr(application, "persistence", None)
+    if not persistence:
+        return
+    flush_callable = getattr(persistence, "flush", None)
+    if not callable(flush_callable):
+        return
+    try:
+        flush_result = flush_callable()
+        if asyncio.iscoroutine(flush_result):
+            await flush_result
+    except Exception:
+        logger.warning("persistence.flush failed", exc_info=True)
+
+
+def _build_live_persistence_state(application: Application) -> dict[str, dict]:
+    return {
+        "bot_data": dict(application.bot_data),
+        "chat_data": dict(application.chat_data),
+        "user_data": dict(application.user_data),
+    }
+
+
+async def persistence_info_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not await _owner_only_command_guard(update=update, context=context, stage="persistence_info_not_owner"):
+        return
+    storage_info = get_storage_file_info(CHAT_STORAGE)
+    live_state = _build_live_persistence_state(context.application)
+    inspect_summary = inspect_persistence_state(
+        live_state,
+        now_ts=time.time(),
+        search_choice_ttl_seconds=SEARCH_CHOICE_TTL_SECONDS,
+        ephemeral_request_ttl_seconds=PERSISTENCE_EPHEMERAL_TTL_SECONDS,
+    )
+    startup_status = PERSISTENCE_STARTUP_SUMMARY.get("status", "n/a")
+    startup_removed = int(PERSISTENCE_STARTUP_SUMMARY.get("removed", 0) or 0)
+    lines = [
+        "Persistence info:",
+        f"- Storage exists: {'yes' if storage_info.get('exists') else 'no'}",
+        f"- Storage size: {_format_size_bytes(int(storage_info.get('size_bytes', 0) or 0))}",
+        f"- Version: {inspect_summary.get('version', infer_persistence_version(context.application.bot_data))}",
+        f"- Temp search choices: total={inspect_summary.get('search_choice_total', 0)} expired={inspect_summary.get('search_choice_expired', 0)}",
+        f"- Temp callback metadata: total={inspect_summary.get('ephemeral_request_total', 0)} expired={inspect_summary.get('ephemeral_request_expired', 0)}",
+        f"- Startup hygiene: {startup_status} removed={startup_removed}",
+    ]
+    await safe_send_message(
+        context.bot,
+        stage="persistence_info_command",
+        chat_id=chat_id,
+        reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+        text="\n".join(lines),
+    )
+    log_pipeline_event("persistence_info_requested", chat_id=chat_id, user_id=user_id, request_type="persistence_info")
+
+
+async def cleanup_persistence_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not await _owner_only_command_guard(update=update, context=context, stage="cleanup_persistence_not_owner"):
+        return
+    total_summary = {
+        "search_choice_removed": 0,
+        "ephemeral_request_removed": 0,
+        "chats_changed": 0,
+    }
+    chat_data_mapping = context.application.chat_data
+    for _, chat_data in chat_data_mapping.items():
+        if not isinstance(chat_data, dict) and not (hasattr(chat_data, "keys") and hasattr(chat_data, "pop")):
+            continue
+        before = len(chat_data)
+        chat_summary = cleanup_chat_data_ephemeral(
+            chat_data,
+            now_ts=time.time(),
+            search_choice_ttl_seconds=SEARCH_CHOICE_TTL_SECONDS,
+            ephemeral_request_ttl_seconds=PERSISTENCE_EPHEMERAL_TTL_SECONDS,
+            dry_run=False,
+        )
+        total_summary["search_choice_removed"] += int(chat_summary.get("search_choice_removed", 0))
+        total_summary["ephemeral_request_removed"] += int(chat_summary.get("ephemeral_request_removed", 0))
+        if len(chat_data) != before:
+            total_summary["chats_changed"] += 1
+    context.application.bot_data[PERSISTENCE_VERSION_KEY] = infer_persistence_version(context.application.bot_data)
+    await _flush_application_persistence(context.application)
+    removed_total = int(total_summary["search_choice_removed"] + total_summary["ephemeral_request_removed"])
+    await safe_send_message(
+        context.bot,
+        stage="cleanup_persistence_command",
+        chat_id=chat_id,
+        reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+        text=(
+            "Cleanup persistence завершён.\n"
+            f"Удалено временных ключей: {removed_total}\n"
+            f"- search_choice: {total_summary['search_choice_removed']}\n"
+            f"- callback metadata: {total_summary['ephemeral_request_removed']}\n"
+            f"Изменено чатов: {total_summary['chats_changed']}"
+        ),
+    )
+    log_pipeline_event(
+        "cleanup_persistence_done",
+        chat_id=chat_id,
+        user_id=user_id,
+        removed=removed_total,
+        search_choice_removed=total_summary["search_choice_removed"],
+        ephemeral_removed=total_summary["ephemeral_request_removed"],
+    )
 
 
 async def status_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1731,7 +1883,13 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                 )
         else:
             url_message_id = str(reply_to_message_id)
-            context.chat_data[url_message_id] = {"urls": urls_dict, "source_ip": source_ip, "proxy": proxy}
+            context.chat_data[url_message_id] = {
+                "urls": urls_dict,
+                "source_ip": source_ip,
+                "proxy": proxy,
+                "created_at": time.time(),
+                "__ephemeral__": True,
+            }
             question = "🎶 Ссылки найдены. Что делаем?"
             button_dl = InlineKeyboardButton(text="⬇️ Скачать", callback_data=" ".join([url_message_id, "dl"]))
             button_link = InlineKeyboardButton(text="🔗️ Показать ссылки", callback_data=" ".join([url_message_id, "link"]))
@@ -3095,6 +3253,8 @@ def get_parsed_runtime_config() -> dict:
         "COOKIES_FILE": COOKIES_FILE or "",
         "MAX_ACTIVE_JOBS_PER_CHAT": MAX_ACTIVE_JOBS_PER_CHAT,
         "MAX_GLOBAL_ACTIVE_JOBS": MAX_GLOBAL_ACTIVE_JOBS,
+        "SEARCH_CHOICE_TTL_SECONDS": SEARCH_CHOICE_TTL_SECONDS,
+        "PERSISTENCE_EPHEMERAL_TTL_SECONDS": PERSISTENCE_EPHEMERAL_TTL_SECONDS,
     }
 
 
@@ -3123,6 +3283,8 @@ def log_startup_summary() -> None:
         "log_mode": "json" if LOG_JSON else "plain",
         "cross_platform_search": ENABLE_CROSS_PLATFORM_SEARCH,
         "web_fallback": ENABLE_WEB_FALLBACK,
+        "search_choice_ttl_seconds": SEARCH_CHOICE_TTL_SECONDS,
+        "persistence_ephemeral_ttl_seconds": PERSISTENCE_EPHEMERAL_TTL_SECONDS,
         "owner_configured": bool(TG_BOT_OWNER_CHAT_ID),
     }
     logger.info(
@@ -3209,6 +3371,7 @@ async def post_shutdown(application: Application) -> None:
 async def post_init(application: Application) -> None:
     SYSTEMD_NOTIFIER.notify("READY=1")
     SYSTEMD_NOTIFIER.notify(f"STATUS=Application initialized")
+    application.bot_data[PERSISTENCE_VERSION_KEY] = infer_persistence_version(application.bot_data)
     RUNTIME_STATE.set_ready(True)
     RUNTIME_STATE.mark_monitor_tick()
     update_runtime_control_metrics()
@@ -3218,6 +3381,8 @@ async def post_init(application: Application) -> None:
         BotCommand("settings", "Настройки"),
         BotCommand("status", "Статус бота"),
         BotCommand("jobs", "Активные задачи (владелец)"),
+        BotCommand("persistence_info", "Состояние persistence (владелец)"),
+        BotCommand("cleanup_persistence", "Очистка persistence (владелец)"),
         BotCommand("search", "Поиск трека"),
         BotCommand("dl", "Скачать по ссылке"),
         BotCommand("link", "Показать прямые ссылки"),
@@ -3313,20 +3478,35 @@ def main():
     #     with open(config_path, 'w') as config_file:
     #         config.write(config_file)
 
-    try:
-        with open(CHAT_STORAGE, "rb") as file:
-            data = pickle.load(file)
-        logger.info(f"Pickle file '{CHAT_STORAGE}' loaded successfully. Can continue loading persistence.")
-    except FileNotFoundError:
-        logger.info(f"The file '{CHAT_STORAGE}' does not exist, it will be created from scratch.")
-    except TypeError as e:
-        logger.info(f"TypeError occurred: {e}. Deleting the file...")
-        os.remove(CHAT_STORAGE)
-        logger.info(f"File '{CHAT_STORAGE}' has been deleted, it will be created from scratch.")
-    except Exception as e:
-        logger.info(f"An unexpected error occurred: {e}. Deleting the file...")
-        os.remove(CHAT_STORAGE)
-        logger.info(f"File '{CHAT_STORAGE}' has been deleted, it will be created from scratch.")
+    global PERSISTENCE_STARTUP_SUMMARY
+    PERSISTENCE_STARTUP_SUMMARY = prepare_persistence_file(
+        CHAT_STORAGE,
+        now_ts=time.time(),
+        search_choice_ttl_seconds=SEARCH_CHOICE_TTL_SECONDS,
+        ephemeral_request_ttl_seconds=PERSISTENCE_EPHEMERAL_TTL_SECONDS,
+    )
+    logger.info(
+        "persistence_startup status=%s exists=%s loaded=%s removed=%s version=%s->%s",
+        PERSISTENCE_STARTUP_SUMMARY.get("status"),
+        PERSISTENCE_STARTUP_SUMMARY.get("exists"),
+        PERSISTENCE_STARTUP_SUMMARY.get("loaded"),
+        PERSISTENCE_STARTUP_SUMMARY.get("removed"),
+        PERSISTENCE_STARTUP_SUMMARY.get("version_before"),
+        PERSISTENCE_STARTUP_SUMMARY.get("version_after"),
+        extra={"event": "persistence_startup", "status": str(PERSISTENCE_STARTUP_SUMMARY.get("status"))},
+    )
+    if PERSISTENCE_STARTUP_SUMMARY.get("backup_path"):
+        logger.warning(
+            "persistence backup created at %s",
+            PERSISTENCE_STARTUP_SUMMARY.get("backup_path"),
+            extra={"event": "persistence_backup_created", "status": "warn"},
+        )
+    if PERSISTENCE_STARTUP_SUMMARY.get("error"):
+        logger.warning(
+            "persistence startup error: %s",
+            PERSISTENCE_STARTUP_SUMMARY.get("error"),
+            extra={"event": "persistence_startup_error", "status": "warn"},
+        )
 
     persistence = PicklePersistence(filepath=CHAT_STORAGE)
 
@@ -3368,6 +3548,8 @@ def main():
     settings_command_handler = CommandHandler("settings", settings_command_callback, block=False)
     status_command_handler = CommandHandler("status", status_command_callback, block=False)
     jobs_command_handler = CommandHandler("jobs", jobs_command_callback, block=False)
+    persistence_info_command_handler = CommandHandler("persistence_info", persistence_info_command_callback, block=False)
+    cleanup_persistence_command_handler = CommandHandler("cleanup_persistence", cleanup_persistence_command_callback, block=False)
     restart_command_handler = CommandHandler("restart", restart_command_callback, block=False)
     search_command_handler = CommandHandler("search", search_command_callback, block=False)
     dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED, block=False)
@@ -3401,6 +3583,8 @@ def main():
     application.add_handler(settings_command_handler)
     application.add_handler(status_command_handler)
     application.add_handler(jobs_command_handler)
+    application.add_handler(persistence_info_command_handler)
+    application.add_handler(cleanup_persistence_command_handler)
     application.add_handler(restart_command_handler)
     application.add_handler(search_command_handler)
     application.add_handler(dl_command_handler)

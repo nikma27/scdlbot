@@ -91,7 +91,28 @@ Prometheus:
 
 - `/status` — компактный runtime snapshot
 - `/jobs` — owner-only список активных задач
+- `/persistence_info` — owner-only сводка по файлу persistence и временным ключам
+- `/cleanup_persistence` — owner-only безопасная очистка временных persistence-ключей
 - `/restart` — owner-only безопасный restart с grace-периодом
+
+## 7.1) PicklePersistence hygiene
+
+Что хранится в `CHAT_STORAGE`:
+- durable: пользовательские настройки чата (`settings`)
+- ephemeral: `search_choice:*` и временные callback/request-метаданные (ключи вида message_id)
+
+Что безопасно чистить:
+- просроченные `search_choice:*` (`SEARCH_CHOICE_TTL_SECONDS`)
+- просроченные временные callback/request-метаданные (`PERSISTENCE_EPHEMERAL_TTL_SECONDS`)
+
+Когда запускать cleanup:
+- вручную через `/cleanup_persistence`, если файл persistence растёт из-за временных ключей
+- автоматически cleanup выполняется на старте и в runtime cleanup-хуках
+
+Поведение при повреждённом pickle:
+- файл не удаляется вслепую
+- создаётся backup `*.corrupt.*.bak`
+- бот стартует с чистым persistence-файлом, сохранив backup для разбирательства
 
 ## 8) Частые проблемы и чеклист
 
