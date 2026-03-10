@@ -1,29 +1,28 @@
-Hi! I download and send *audios* of tracks/sets/albums/videos/playlists from free streaming websites in *MP3* format with tags and artwork.
+Привет! Я ищу и отправляю треки в максимально доступном качестве с тегами и обложкой.
 
-*Usage:*
-_Send or forward_ a text message containing links and I will:
-• In *Download* mode: download every link I support (or you may use a direct command `/dl <links>`)
-• In *Links* mode: show direct download URLs for every link (or you may use a direct command `/link <links>`)
-• In *Ask* mode: scan for supported links and ask you to choose what to do with them: download or get links
-• Use /settings to select working mode for messages sent *without direct command* (simple messages with links).
-• Use /settings to toggle *Captions*.
-• Use `/search <query>` to search audio/video on *VK*.
-• [Privacy mode](https://core.telegram.org/bots/features#privacy-mode) is _disabled_, so that I scan every group message.
-• Supported links and streaming websites:
-- *SoundCloud*: tracks/playlists/pages with private widgets
-- *Bandcamp*: tracks/albums/custom links
-- *YouTube*: videos/playlists/_not_ lives
-- *VK*: audio/video
-- *Mixcloud, Vimeo and* [pretty much everything from this list](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) if you enable *Unknown sites*
+*Что я умею:*
+• Отправляете ссылку — я извлекаю трек/релиз, ищу лучший доступный источник и отправляю готовый файл.
+• Отправляете текст (`исполнитель трек`) — я запускаю поиск по площадкам и пытаюсь скачать лучший вариант.
+• Если на основных площадках не найдено — включаю быстрый глобальный поиск.
 
-*Example message with links:*
-`Hey, check this out! https://m.soundcloud.com/falling-ethics/jk-flesh-static-demon-fexelvn004 and also https://shitmat.bandcamp.com/track/amen-babylon-2016-mix and youtu.be/Mdzy5RKn434 and https://vk.com/audio123456_789`
+*Команды:*
+• `/start` — запуск.
+• `/help` — это сообщение.
+• `/search <исполнитель> <трек>` — явный поиск.
+• `/dl <ссылка>` — скачать и прислать файл.
+• `/link <ссылка>` — показать прямые ссылки без загрузки.
+• `/settings` — настройки режима работы и подписи.
+• `/restart` — перезапуск бота (только владелец).
+• Если найдено несколько вариантов — сначала покажу выбор качества, затем скачаю выбранный.
 
-👨🏻‍💻 *Developed by @gpchelkin*:
-[🐝 Channel](https://t.me/ggpchelkin/150) | [🐝 Homepage](https://g.pchelk.in)
-[🌟 Star me on GitHub!](https://github.com/gpchelkin/scdlbot) | [⚠️ Report an issue](https://github.com/gpchelkin/scdlbot/issues)
-💵 Support development:
-[Buy Me a Coffee](https://www.buymeacoffee.com/gpchelkin) | [PayPal](http://paypal.me/gggpchelkin) | [Tinkoff](https://www.tinkoff.ru/rm/r_pNKeBoDLLB.jXIdjrpSop/xqHkU97064) | [YooMoney](https://yoomoney.ru/to/41001421333857/200)
+*Поддерживаемые источники:*
+• SoundCloud
+• Bandcamp
+• YouTube
+• VK
+• Texamp
+• и другие сайты из экосистемы `yt-dlp`.
 
-🎶 Inspired by `Electrocircle`: [⚡⚫ Channel](https://t.me/Eklight) | [⚡⚫ Channel 2](https://t.me/electrocircle_online)
-👩🏻‍🎨 Previous logo by [🖼️ Lowonbudget](https://www.behance.net/lowonbudget)
+*Важно:*
+• Качество зависит от того, что реально доступно у источника.
+• Если source отдаёт только 128 kbps, выше получить невозможно.

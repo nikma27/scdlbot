@@ -136,22 +136,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_int_list(name: str, default: list[int] | None = None) -> list[int]:
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
-        return list(default or [])
-    parsed: list[int] = []
-    for item in str(raw).split(","):
-        item_clean = item.strip().replace("_", "")
-        if not item_clean:
-            continue
-        try:
-            parsed.append(int(item_clean))
-        except Exception:
-            continue
-    return parsed or list(default or [])
-
-
 TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
 TG_BOT_API = os.getenv("TG_BOT_API", "https://api.telegram.org")
 # https://github.com/python-telegram-bot/python-telegram-bot/wiki/Local-Bot-API-Server
@@ -166,12 +150,8 @@ if TG_BOT_API_LOCAL_MODE:
     HTTP_VERSION = "1.1"
 TG_BOT_OWNER_CHAT_ID = _env_int("TG_BOT_OWNER_CHAT_ID", 0)
 
-DEFAULT_CHAT_STORAGE_PATH = "/tmp/scdlbot.pickle"
-DEFAULT_DL_DIR_PATH = "/tmp/scdlbot"
-CHAT_STORAGE = os.path.expanduser((os.getenv("CHAT_STORAGE") or DEFAULT_CHAT_STORAGE_PATH).strip() or DEFAULT_CHAT_STORAGE_PATH)
-DL_DIR = os.path.expanduser((os.getenv("DL_DIR") or DEFAULT_DL_DIR_PATH).strip() or DEFAULT_DL_DIR_PATH)
-CHAT_STORAGE_FALLBACK = os.path.expanduser((os.getenv("CHAT_STORAGE_FALLBACK") or DEFAULT_CHAT_STORAGE_PATH).strip() or DEFAULT_CHAT_STORAGE_PATH)
-DL_DIR_FALLBACK = os.path.expanduser((os.getenv("DL_DIR_FALLBACK") or DEFAULT_DL_DIR_PATH).strip() or DEFAULT_DL_DIR_PATH)
+CHAT_STORAGE = os.path.expanduser(os.getenv("CHAT_STORAGE", "/tmp/scdlbot.pickle"))
+DL_DIR = os.path.expanduser(os.getenv("DL_DIR", "/tmp/scdlbot"))
 BIN_PATH = os.getenv("BIN_PATH", "")
 scdl_bin = local[os.path.join(BIN_PATH, "scdl")]
 bcdl_bin = local[os.path.join(BIN_PATH, "bandcamp-dl")]
@@ -205,7 +185,7 @@ ENABLE_WEB_FALLBACK = _env_bool("ENABLE_WEB_FALLBACK", True)
 FALLBACK_MAX_CANDIDATES = _env_int("FALLBACK_MAX_CANDIDATES", 8)
 YOUTUBE_MIN_HEIGHT = _env_int("YOUTUBE_MIN_HEIGHT", 1080)
 SEARCH_RESULT_LIMIT = _env_int("SEARCH_RESULT_LIMIT", 5)
-NO_FLOOD_CHAT_IDS = _env_int_list("NO_FLOOD_CHAT_IDS", default=[0])
+NO_FLOOD_CHAT_IDS = list(map(int, os.getenv("NO_FLOOD_CHAT_IDS", "0").split(",")))
 COOKIES_FILE = os.getenv("COOKIES_FILE", None)
 PROXIES = []
 if "PROXIES" in os.environ:
@@ -229,12 +209,22 @@ BLACKLIST_TELEGRAM_DOMAINS = [
 ]
 WHITELIST_DOMAINS = {}
 if "WHITELIST_DOMAINS" in os.environ:
-    WHITELIST_DOMAINS = set(x.strip() for x in os.getenv("WHITELIST_DOMAINS").split(",") if x.strip())
+    WHITELIST_DOMAINS = set(x for x in os.getenv("WHITELIST_DOMAINS").split(","))
 BLACKLIST_DOMAINS = {}
 if "BLACKLIST_DOMAINS" in os.environ:
-    BLACKLIST_DOMAINS = set(x.strip() for x in os.getenv("BLACKLIST_DOMAINS").split(",") if x.strip())
-WHITELIST_CHATS = set(_env_int_list("WHITELIST_CHATS"))
-BLACKLIST_CHATS = set(_env_int_list("BLACKLIST_CHATS"))
+    BLACKLIST_DOMAINS = set(x for x in os.getenv("BLACKLIST_DOMAINS").split(","))
+WHITELIST_CHATS = []
+if "WHITELIST_CHATS" in os.environ:
+    try:
+        WHITELIST_CHATS = set(int(x) for x in os.getenv("WHITELIST_CHATS").split(","))
+    except ValueError:
+        raise ValueError("Your whitelisted chats list does not contain valid integers.")
+BLACKLIST_CHATS = []
+if "BLACKLIST_CHATS" in os.environ:
+    try:
+        BLACKLIST_CHATS = set(int(x) for x in os.getenv("BLACKLIST_CHATS").split(","))
+    except ValueError:
+        raise ValueError("Your blacklisted chats list does not contain valid integers.")
 
 # Webhook:
 WEBHOOK_ENABLE = _env_bool("WEBHOOK_ENABLE", False)
@@ -1005,10 +995,8 @@ async def persistence_info_command_callback(update: Update, context: ContextType
     startup_removed = int(PERSISTENCE_STARTUP_SUMMARY.get("removed", 0) or 0)
     lines = [
         "Persistence info:",
-        f"- Storage path: {CHAT_STORAGE}",
         f"- Storage exists: {'yes' if storage_info.get('exists') else 'no'}",
         f"- Storage size: {_format_size_bytes(int(storage_info.get('size_bytes', 0) or 0))}",
-        f"- Storage mode: {'ephemeral (/tmp)' if CHAT_STORAGE.startswith('/tmp/') or CHAT_STORAGE == '/tmp' else 'configured path'}",
         f"- Version: {inspect_summary.get('version', infer_persistence_version(context.application.bot_data))}",
         f"- Temp search choices: total={inspect_summary.get('search_choice_total', 0)} expired={inspect_summary.get('search_choice_expired', 0)}",
         f"- Temp callback metadata: total={inspect_summary.get('ephemeral_request_total', 0)} expired={inspect_summary.get('ephemeral_request_expired', 0)}",
@@ -3242,90 +3230,6 @@ def run_dl_dir_maintenance(stage: str) -> None:
         )
 
 
-def _ensure_writable_directory(path: pathlib.Path) -> bool:
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        probe_name = f".write_probe_{os.getpid()}"
-        probe = path / probe_name
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
-
-
-def _resolve_storage_file_path(*, configured_path: str, fallback_path: str, label: str) -> str:
-    configured = pathlib.Path(configured_path).expanduser()
-    if _ensure_writable_directory(configured.parent):
-        return str(configured)
-    fallback = pathlib.Path(fallback_path).expanduser()
-    if _ensure_writable_directory(fallback.parent):
-        logger.warning(
-            "%s path is not writable: %s; falling back to %s",
-            label,
-            configured,
-            fallback,
-            extra={"event": "storage_fallback", "status": "warn"},
-        )
-        return str(fallback)
-    logger.warning(
-        "%s path and fallback path are not writable: configured=%s fallback=%s",
-        label,
-        configured,
-        fallback,
-        extra={"event": "storage_fallback", "status": "error"},
-    )
-    return str(configured)
-
-
-def _resolve_storage_dir_path(*, configured_path: str, fallback_path: str, label: str) -> str:
-    configured = pathlib.Path(configured_path).expanduser()
-    if _ensure_writable_directory(configured):
-        return str(configured)
-    fallback = pathlib.Path(fallback_path).expanduser()
-    if _ensure_writable_directory(fallback):
-        logger.warning(
-            "%s path is not writable: %s; falling back to %s",
-            label,
-            configured,
-            fallback,
-            extra={"event": "storage_fallback", "status": "warn"},
-        )
-        return str(fallback)
-    logger.warning(
-        "%s path and fallback path are not writable: configured=%s fallback=%s",
-        label,
-        configured,
-        fallback,
-        extra={"event": "storage_fallback", "status": "error"},
-    )
-    return str(configured)
-
-
-def apply_cloud_storage_fallbacks() -> None:
-    """Resolve storage paths for ephemeral cloud runtimes."""
-    global CHAT_STORAGE, DL_DIR
-    CHAT_STORAGE = _resolve_storage_file_path(
-        configured_path=CHAT_STORAGE,
-        fallback_path=CHAT_STORAGE_FALLBACK,
-        label="CHAT_STORAGE",
-    )
-    DL_DIR = _resolve_storage_dir_path(
-        configured_path=DL_DIR,
-        fallback_path=DL_DIR_FALLBACK,
-        label="DL_DIR",
-    )
-    storage_ephemeral = CHAT_STORAGE.startswith("/tmp/") or CHAT_STORAGE == "/tmp"
-    downloads_ephemeral = DL_DIR.startswith("/tmp/") or DL_DIR == "/tmp"
-    if storage_ephemeral or downloads_ephemeral:
-        logger.info(
-            "ephemeral storage mode active chat_storage=%s dl_dir=%s",
-            CHAT_STORAGE,
-            DL_DIR,
-            extra={"event": "ephemeral_storage_mode", "status": "ok"},
-        )
-
-
 def get_parsed_runtime_config() -> dict:
     return {
         "TG_BOT_TOKEN": TG_BOT_TOKEN,
@@ -3333,9 +3237,7 @@ def get_parsed_runtime_config() -> dict:
         "TG_BOT_API_LOCAL_MODE": TG_BOT_API_LOCAL_MODE,
         "TG_BOT_OWNER_CHAT_ID": TG_BOT_OWNER_CHAT_ID,
         "CHAT_STORAGE": CHAT_STORAGE,
-        "CHAT_STORAGE_FALLBACK": CHAT_STORAGE_FALLBACK,
         "DL_DIR": DL_DIR,
-        "DL_DIR_FALLBACK": DL_DIR_FALLBACK,
         "WORKERS": WORKERS,
         "EXECUTOR_KIND": EXECUTOR_KIND,
         "DL_TIMEOUT": DL_TIMEOUT,
@@ -3373,9 +3275,7 @@ def log_startup_summary() -> None:
         "executor_kind": EXECUTOR_KIND,
         "workers": WORKERS,
         "dl_dir": DL_DIR,
-        "dl_dir_fallback": DL_DIR_FALLBACK,
         "chat_storage": CHAT_STORAGE,
-        "chat_storage_fallback": CHAT_STORAGE_FALLBACK,
         "metrics_enabled": True,
         "metrics_port": METRICS_PORT,
         "healthcheck_enabled": HEALTHCHECK_ENABLE,
@@ -3385,7 +3285,6 @@ def log_startup_summary() -> None:
         "web_fallback": ENABLE_WEB_FALLBACK,
         "search_choice_ttl_seconds": SEARCH_CHOICE_TTL_SECONDS,
         "persistence_ephemeral_ttl_seconds": PERSISTENCE_EPHEMERAL_TTL_SECONDS,
-        "ephemeral_storage": CHAT_STORAGE.startswith("/tmp/") or CHAT_STORAGE == "/tmp" or DL_DIR.startswith("/tmp/") or DL_DIR == "/tmp",
         "owner_configured": bool(TG_BOT_OWNER_CHAT_ID),
     }
     logger.info(
@@ -3540,7 +3439,6 @@ async def callback_monitor(context: ContextTypes.DEFAULT_TYPE):
 def main():
     global HEALTHCHECK_SERVER
 
-    apply_cloud_storage_fallbacks()
     validate_runtime_or_raise()
 
     # Start exposing Prometheus/OpenMetrics metrics:

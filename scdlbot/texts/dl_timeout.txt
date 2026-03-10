@@ -1,1 +1,2 @@
-*Sorry*, your download was taking too much time (more than {} minutes), so I needed to stop it. You can get direct links and download for yourself with a `/link <links>` command.
+Скачивание заняло слишком много времени (более {} минут), поэтому я остановил задачу.
+Попробуйте ещё раз позже.

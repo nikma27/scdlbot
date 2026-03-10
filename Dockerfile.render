@@ -45,6 +45,7 @@ COPY --from=builder --chown=1000:1000 /app /app/
 # of container-escape attack.
 USER 1000:1000
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1
 
 # This sources all /app/.profile.d/*.sh files before process start.
 # These are created by buildpacks, and you probably don't have to worry about this.
@@ -56,3 +57,9 @@ ENTRYPOINT [ "/render/setup-env" ]
 # process type name in the CMD line below. That process type must have been
 # defined in the app's Procfile during build.
 CMD [ "/render/process/web" ]
+
+# Render deploys may run without HEALTHCHECK_ENABLE; keep healthcheck no-op then.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD python -c "import os,sys,urllib.request; \
+enabled=os.getenv('HEALTHCHECK_ENABLE','0') in {'1','true','True','yes','on'}; \
+port=os.getenv('HEALTHCHECK_PORT','8080'); \
+sys.exit(0) if not enabled else sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3).status==200 else 1)"

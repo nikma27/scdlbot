@@ -27,6 +27,14 @@ services:
         value: 45_000_000
       - key: LOGLEVEL
         value: INFO
+      - key: LOG_JSON
+        value: 1
+      - key: HEALTHCHECK_ENABLE
+        value: 1
+      - key: HEALTHCHECK_HOST
+        value: 0.0.0.0
+      - key: HEALTHCHECK_PORT
+        value: 8080
 #      - key: TG_BOT_TOKEN
 #      - key: SYSLOG_ADDRESS
 #      - key: NO_FLOOD_CHAT_IDS

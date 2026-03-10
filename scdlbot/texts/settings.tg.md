@@ -1,8 +1,8 @@
-Select working mode for messages sent *without direct command* (simple messages with links).
-Sane defaults are *Download* for *private chats* and *Ask* for *group chats*.
+Выберите режим для сообщений *без команды* (обычные сообщения со ссылками).
+Рекомендуемые настройки: *Download* для личных чатов и *Ask* для групп.
 
-Enable *Captions* to send audios *with source info in captions* and *as replies to original message*.
+Опция *Captions* — отправлять треки с подписью источника и ответом на исходное сообщение.
 
-Enable *Unknown sites* to allow checking unknown sites (see /help).
+Опция *Unknown sites* — разрешить обработку неизвестных сайтов (подробнее в /help).
 
-Settings might reset occasionally.
+Настройки иногда могут сбрасываться.

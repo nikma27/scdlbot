@@ -1,1 +1,3 @@
-*Sorry*, something went wrong. A team of highly trained 🐝🐝🐝 has been dispatched to deal with this situation, but I recommend you to double-check if your link is alive and supported, see /help
+Произошла ошибка при обработке ссылки.
+Проверьте, что ссылка доступна, и попробуйте ещё раз.
+Справка: /help
