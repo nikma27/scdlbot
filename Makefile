@@ -52,6 +52,12 @@ preflight:
 smoke_test:
 	poetry run python -m unittest discover -s tests -p "test_*.py"
 
+.PHONY: ci
+ci:
+	poetry run python -m py_compile scdlbot/__main__.py scdlbot/quality_fallback.py scdlbot/search_logic.py scdlbot/runtime_ops.py scdlbot/runtime_limits.py scdlbot/config_validation.py
+	poetry run python -c "import scdlbot.__main__; import scdlbot.quality_fallback; import scdlbot.search_logic; import scdlbot.runtime_ops; import scdlbot.runtime_limits; import scdlbot.config_validation; print('import_smoke_ok')"
+	poetry run python -m unittest discover -s tests -p "test_*.py"
+
 .PHONY: run
 run:
 	poetry run python -m scdlbot

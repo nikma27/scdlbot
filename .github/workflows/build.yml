@@ -2,9 +2,6 @@ name: build
 
 on:
   push:
-    branches:
-      - master
-      - release
   pull_request:
   workflow_dispatch:
 
@@ -16,11 +13,11 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  ci:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.11', '3.13']
 
     steps:
     - uses: actions/checkout@v4.2.2
@@ -34,18 +31,15 @@ jobs:
     - name: Install Poetry
       run: |
         pip install --upgrade pip
-        pip install --upgrade setuptools wheel
-        export POETRY_VERSION=2.3.1
-        wget --output-document=install-poetry.py https://install.python-poetry.org
-        python "install-poetry.py"
-        rm -f "install-poetry.py"
-        echo "$HOME/.poetry/bin" >> $GITHUB_PATH
-        poetry config installer.parallel true
-        poetry config installer.modern-installation true
+        pip install --upgrade poetry
+        poetry --version
 
-    - name: Install tox
+    - name: Install dependencies
       run: |
-        pip install --upgrade tox tox-gh-actions
+        poetry install --with main,dev,flacbot --sync
 
-    - name: Test with tox
-      run: tox
+    - name: Run CI smoke checks
+      env:
+        TG_BOT_TOKEN: "dummy_token_for_ci"
+      run: |
+        make ci
