@@ -87,6 +87,7 @@ from scdlbot.runtime_ops import (
     start_healthcheck_server,
     summarize_executor,
 )
+from scdlbot.runtime_limits import AdmissionDecision, RuntimeAdmission
 from scdlbot.search_logic import (
     VK_AUDIO_ID_PATH_RE,
     build_query_from_message_text,
@@ -240,6 +241,33 @@ LAST_ERROR_TS_GAUGE = prometheus_client.Gauge(
     "Last error epoch seconds",
     registry=REGISTRY,
 )
+ACTIVE_JOBS_TOTAL_GAUGE = prometheus_client.Gauge(
+    "active_jobs_total",
+    "Total active jobs tracked in memory",
+    registry=REGISTRY,
+)
+ACTIVE_JOBS_BY_TYPE_GAUGE = prometheus_client.Gauge(
+    "active_jobs_by_type",
+    "Active jobs by type",
+    labelnames=["job_type"],
+    registry=REGISTRY,
+)
+REQUEST_REJECTED_TOTAL = prometheus_client.Counter(
+    "request_rejected_total",
+    "Rejected requests by admission reason",
+    labelnames=["reason"],
+    registry=REGISTRY,
+)
+SHUTDOWN_REQUESTED_GAUGE = prometheus_client.Gauge(
+    "shutdown_requested",
+    "Shutdown requested flag (0/1)",
+    registry=REGISTRY,
+)
+RESTART_REQUESTS_TOTAL = prometheus_client.Counter(
+    "restart_requests_total",
+    "Total restart requests",
+    registry=REGISTRY,
+)
 
 # Logging:
 logging_handlers = []
@@ -256,6 +284,15 @@ DL_DIR_MAX_BYTES = int(os.getenv("DL_DIR_MAX_BYTES", "0"))
 DL_DIR_MAX_FILE_COUNT = int(os.getenv("DL_DIR_MAX_FILE_COUNT", "0"))
 RESTART_COOLDOWN_SECONDS = int(os.getenv("RESTART_COOLDOWN_SECONDS", "30"))
 RESTART_STATE_FILE = os.path.expanduser(os.getenv("RESTART_STATE_FILE", "/tmp/scdlbot_restart_ts"))
+SHUTDOWN_GRACE_SECONDS = int(os.getenv("SHUTDOWN_GRACE_SECONDS", "10"))
+
+MAX_ACTIVE_JOBS_PER_USER = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "2"))
+MAX_ACTIVE_JOBS_PER_CHAT = int(os.getenv("MAX_ACTIVE_JOBS_PER_CHAT", "4"))
+MAX_GLOBAL_ACTIVE_JOBS = int(os.getenv("MAX_GLOBAL_ACTIVE_JOBS", "8"))
+USER_REQUEST_COOLDOWN_SECONDS = int(os.getenv("USER_REQUEST_COOLDOWN_SECONDS", "3"))
+CHAT_REQUEST_COOLDOWN_SECONDS = int(os.getenv("CHAT_REQUEST_COOLDOWN_SECONDS", "1"))
+BURST_REQUEST_LIMIT = int(os.getenv("BURST_REQUEST_LIMIT", "5"))
+BURST_WINDOW_SECONDS = int(os.getenv("BURST_WINDOW_SECONDS", "20"))
 
 console_formatter: logging.Formatter
 if LOG_JSON:
@@ -289,7 +326,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RUNTIME_STATE = RuntimeState()
+RUNTIME_ADMISSION = RuntimeAdmission()
 HEALTHCHECK_SERVER = None
+POST_SHUTDOWN_DONE = False
+POST_SHUTDOWN_LOCK = threading.Lock()
 
 # Systemd watchdog monitoring:
 SYSTEMD_NOTIFIER = sdnotify.SystemdNotifier()
@@ -597,6 +637,75 @@ def cleanup_expired_search_choice_cache(chat_data: dict, *, chat_id: int | None 
         )
 
 
+def update_runtime_control_metrics() -> None:
+    jobs_snapshot = RUNTIME_ADMISSION.active_jobs_snapshot()
+    ACTIVE_JOBS_TOTAL_GAUGE.set(jobs_snapshot.get("total", 0))
+    for job_type in ("search", "download"):
+        ACTIVE_JOBS_BY_TYPE_GAUGE.labels(job_type=job_type).set(jobs_snapshot.get("by_type", {}).get(job_type, 0))
+    shutdown_snapshot = RUNTIME_ADMISSION.shutdown_snapshot()
+    SHUTDOWN_REQUESTED_GAUGE.set(1 if shutdown_snapshot.get("shutdown_requested") else 0)
+
+
+def request_shutdown(*, reason: str, actor: str = "") -> bool:
+    created = RUNTIME_ADMISSION.request_shutdown(reason=reason, actor=actor)
+    if created:
+        log_pipeline_event("shutdown_requested", status="ok", source=reason, user_id=actor or None)
+    update_runtime_control_metrics()
+    return created
+
+
+def is_shutdown_requested() -> bool:
+    return RUNTIME_ADMISSION.is_shutdown_requested()
+
+
+async def check_request_admission(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    request_type: str,
+    query: str = "",
+    url: str = "",
+    reply_to_message_id: int | None = None,
+) -> AdmissionDecision:
+    decision = RUNTIME_ADMISSION.check_request_admission(
+        request_type=request_type,
+        user_id=user_id,
+        chat_id=chat_id,
+        query_preview=_safe_log_query(query),
+        url_preview=safe_url_preview(url),
+        is_owner=(user_id == TG_BOT_OWNER_CHAT_ID),
+        max_active_jobs_per_user=MAX_ACTIVE_JOBS_PER_USER,
+        max_active_jobs_per_chat=MAX_ACTIVE_JOBS_PER_CHAT,
+        max_global_active_jobs=MAX_GLOBAL_ACTIVE_JOBS,
+        user_request_cooldown_seconds=USER_REQUEST_COOLDOWN_SECONDS,
+        chat_request_cooldown_seconds=CHAT_REQUEST_COOLDOWN_SECONDS,
+        burst_request_limit=BURST_REQUEST_LIMIT,
+        burst_window_seconds=BURST_WINDOW_SECONDS,
+    )
+    if not decision.allowed:
+        REQUEST_REJECTED_TOTAL.labels(reason=decision.reason_code).inc()
+        log_pipeline_event(
+            "request_rejected",
+            chat_id=chat_id,
+            user_id=user_id,
+            request_type=request_type,
+            query=query,
+            url=url,
+            status=decision.reason_code,
+        )
+        if decision.user_message:
+            await safe_send_message(
+                context.bot,
+                stage="request_rejected",
+                chat_id=chat_id,
+                reply_to_message_id=reply_to_message_id,
+                text=decision.user_message,
+            )
+    update_runtime_control_metrics()
+    return decision
+
+
 def _read_restart_marker_ts() -> float:
     try:
         with open(RESTART_STATE_FILE, "r", encoding="utf-8") as marker_file:
@@ -629,12 +738,16 @@ def request_restart(*, reason: str, actor_user_id: int | None = None, chat_id: i
     now_ts = time.time()
     _write_restart_marker_ts(now_ts)
     RUNTIME_STATE.mark_restart_request()
+    RESTART_REQUESTS_TOTAL.inc()
+    update_runtime_control_metrics()
+    jobs_snapshot = RUNTIME_ADMISSION.active_jobs_snapshot()
     log_pipeline_event(
         "restart_requested",
         chat_id=chat_id,
         user_id=actor_user_id,
         status="ok",
         source=reason,
+        active_jobs=jobs_snapshot.get("total", 0),
     )
     os.execv(sys.executable, [sys.executable, "-m", "scdlbot"])
 
@@ -771,6 +884,83 @@ async def settings_command_callback(update: Update, context: ContextTypes.DEFAUL
     await context.bot.send_message(chat_id=chat_id, parse_mode="Markdown", reply_markup=get_settings_inline_keyboard(context.chat_data), text=SETTINGS_TEXT)
 
 
+def _format_runtime_ts(value: float) -> str:
+    if not value:
+        return "n/a"
+    return datetime.datetime.fromtimestamp(value).strftime("%H:%M:%S")
+
+
+def _runtime_mode() -> str:
+    return "webhook" if WEBHOOK_ENABLE else "polling"
+
+
+async def status_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    snapshot = get_runtime_snapshot()
+    jobs_snapshot = RUNTIME_ADMISSION.active_jobs_snapshot()
+    shutdown_snapshot = RUNTIME_ADMISSION.shutdown_snapshot()
+    text = (
+        f"Статус: {'готов' if snapshot.get('ready') else 'инициализация'}\n"
+        f"Режим: {_runtime_mode()} | Логи: {'json' if LOG_JSON else 'plain'}\n"
+        f"Uptime: {snapshot.get('uptime_seconds', 0)}s\n"
+        f"Shutdown: {'yes' if shutdown_snapshot.get('shutdown_requested') else 'no'}\n"
+        f"Jobs: total={jobs_snapshot.get('total', 0)} search={jobs_snapshot.get('by_type', {}).get('search', 0)} download={jobs_snapshot.get('by_type', {}).get('download', 0)}\n"
+        f"Limits: u={MAX_ACTIVE_JOBS_PER_USER} c={MAX_ACTIVE_JOBS_PER_CHAT} g={MAX_GLOBAL_ACTIVE_JOBS}\n"
+        f"Cooldown: user={USER_REQUEST_COOLDOWN_SECONDS}s chat={CHAT_REQUEST_COOLDOWN_SECONDS}s burst={BURST_REQUEST_LIMIT}/{BURST_WINDOW_SECONDS}s\n"
+        f"Executor: {EXECUTOR_KIND} workers={WORKERS} pending={snapshot.get('pending_tasks', 0)}\n"
+        f"Health: {'on' if HEALTHCHECK_ENABLE else 'off'} {HEALTHCHECK_HOST}:{HEALTHCHECK_PORT}\n"
+        f"Last monitor: {_format_runtime_ts(snapshot.get('last_monitor_tick', 0))} | Last error: {_format_runtime_ts(snapshot.get('last_error_ts', 0))}"
+    )
+    await safe_send_message(
+        context.bot,
+        stage="status_command",
+        chat_id=chat_id,
+        reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+        text=text,
+    )
+    log_pipeline_event("status_requested", chat_id=chat_id, user_id=user_id, request_type="status")
+
+
+async def jobs_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    message = update.effective_message
+    if user_id != TG_BOT_OWNER_CHAT_ID:
+        await safe_send_message(
+            context.bot,
+            stage="jobs_not_owner",
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id if message else None,
+            text="Команда доступна только владельцу бота.",
+        )
+        return
+    jobs = RUNTIME_ADMISSION.get_jobs(limit=10)
+    now_ts = time.time()
+    header = f"Активных задач: {RUNTIME_ADMISSION.active_jobs_snapshot().get('total', 0)}"
+    if not jobs:
+        await safe_send_message(
+            context.bot,
+            stage="jobs_command_empty",
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id if message else None,
+            text=header + "\nНет активных задач.",
+        )
+        return
+    lines = [header]
+    for job in jobs:
+        age = max(0, int(now_ts - job.started_at))
+        preview = job.query_preview or job.url_preview or "-"
+        lines.append(f"- {job.job_id} {job.job_type} {age}s u={job.user_id} c={job.chat_id} {preview[:60]}")
+    await safe_send_message(
+        context.bot,
+        stage="jobs_command",
+        chat_id=chat_id,
+        reply_to_message_id=message.message_id if message else None,
+        text="\n".join(lines),
+    )
+
+
 async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command_name = "restart"
     chat_id = update.effective_chat.id
@@ -798,6 +988,8 @@ async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT
             text=f"Перезапуск уже запрошен недавно. Подождите {cooldown_remaining} сек.",
         )
         return
+    request_shutdown(reason="owner_restart", actor=str(user_id))
+    active_before = RUNTIME_ADMISSION.active_jobs_snapshot().get("total", 0)
     await safe_send_message(
         context.bot,
         stage="restart_ack",
@@ -805,6 +997,19 @@ async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT
         reply_to_message_id=message.message_id if message else None,
         text="Перезапускаю бота...",
     )
+    if active_before > 0 and SHUTDOWN_GRACE_SECONDS > 0:
+        await safe_send_message(
+            context.bot,
+            stage="restart_grace_wait",
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id if message else None,
+            text=f"Ожидаю завершение активных задач (до {SHUTDOWN_GRACE_SECONDS} сек)...",
+        )
+        deadline = time.time() + SHUTDOWN_GRACE_SECONDS
+        while time.time() < deadline:
+            if RUNTIME_ADMISSION.active_jobs_snapshot().get("total", 0) <= 0:
+                break
+            await asyncio.sleep(1)
     await asyncio.sleep(0.2)
     request_restart(reason="owner_command", actor_user_id=user_id, chat_id=chat_id)
 
@@ -992,6 +1197,16 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
                 parse_mode="Markdown",
             )
         return
+    admission = await check_request_admission(
+        context=context,
+        chat_id=chat_id,
+        user_id=user_id,
+        request_type=command_name,
+        query=query,
+        reply_to_message_id=update.effective_message.message_id,
+    )
+    if not admission.allowed:
+        return
     log_pipeline_event("search_start", request_id=request_id, chat_id=chat_id, user_id=user_id, query=query, command=command_name)
     init_chat_data(
         chat_data=context.chat_data,
@@ -1024,8 +1239,30 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         source_ip=source_ip,
         proxy=proxy,
     )
+    search_job_id = RUNTIME_ADMISSION.register_job(
+        job_type="search",
+        user_id=user_id,
+        chat_id=chat_id,
+        request_type=command_name,
+        query_preview=_safe_log_query(query),
+    )
+    if not search_job_id:
+        await safe_edit_message_text(
+            context.bot,
+            stage="search_shutdown_gate",
+            chat_id=chat_id,
+            message_id=wait_message.message_id,
+            text="Бот завершает работу, новые задачи временно не принимаются.",
+        )
+        update_runtime_control_metrics()
+        return
+    update_runtime_control_metrics()
     try:
-        results = await loop_main.run_in_executor(None, search_runner)
+        try:
+            results = await loop_main.run_in_executor(None, search_runner)
+        finally:
+            RUNTIME_ADMISSION.finish_job(search_job_id)
+            update_runtime_control_metrics()
     except Exception:
         logger.warning(
             "search pipeline failed stage=rank chat_id=%s user_id=%s query=%s",
@@ -1104,7 +1341,16 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
             "proxy": proxy,
             "query_hint": query,
         }
-        schedule_download_task(kwargs)
+        await admit_and_schedule_download(
+            context=context,
+            chat_id=chat_id,
+            user_id=user_id,
+            request_type="search_download",
+            url=choice["url"],
+            query_hint=query,
+            reply_to_message_id=update.effective_message.message_id,
+            kwargs=kwargs,
+        )
         return
     search_token = uuid4().hex[:10]
     search_cache_key = f"{SEARCH_CHOICE_CACHE_PREFIX}{search_token}"
@@ -1181,7 +1427,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     user_id = update.effective_user.id if update.effective_user else 0
     RUNTIME_STATE.mark_success()
     if not chat_allowed(chat_id):
-        await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
+        await safe_send_message(context.bot, stage="links_not_allowed", chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
     # Private chats default to direct download mode; group chats default to ask mode.
     init_chat_data(
@@ -1234,6 +1480,17 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     query_hint = build_query_from_message_text(message_text)
     if not is_usable_query(query_hint):
         query_hint = ""
+    admission = await check_request_admission(
+        context=context,
+        chat_id=chat_id,
+        user_id=user_id,
+        request_type=command_name,
+        query=query_hint or message_text,
+        url=message_text if "http" in message_text else "",
+        reply_to_message_id=reply_to_message_id,
+    )
+    if not admission.allowed:
+        return
     if action in ["dl", "link"]:
         await safe_send_chat_action(context.bot, stage="dl_link_wait_typing", chat_id=chat_id, action=ChatAction.TYPING)
         wait_message = await safe_send_message(
@@ -1262,6 +1519,24 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     # We monitor EXECUTOR process pool task queue, so we use it.
 
     # pool = concurrent.futures.ThreadPoolExecutor()
+    resolve_job_id = RUNTIME_ADMISSION.register_job(
+        job_type="search",
+        user_id=user_id,
+        chat_id=chat_id,
+        request_type=command_name,
+        query_preview=_safe_log_query(query_hint or message_text),
+    )
+    if not resolve_job_id:
+        await safe_send_message(
+            context.bot,
+            stage="links_shutdown_gate",
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text="Бот завершает работу, новые задачи временно не принимаются.",
+        )
+        update_runtime_control_metrics()
+        return
+    update_runtime_control_metrics()
     try:
         # https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor
         # https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for
@@ -1285,6 +1560,9 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
             action,
             exc_info=True,
         )
+    finally:
+        RUNTIME_ADMISSION.finish_job(resolve_job_id)
+        update_runtime_control_metrics()
     # pool.shutdown(wait=False, cancel_futures=True)
 
     logger.debug(f"prepare_urls: urls dict: {urls_dict}")
@@ -1391,7 +1669,16 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                     await safe_send_chat_action(context.bot, stage="dl_action_record_voice", chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
                     # EXECUTOR.submit(download_url_and_send, **kwargs)
-                    schedule_download_task(kwargs)
+                    await admit_and_schedule_download(
+                        context=context,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        request_type=command_name,
+                        url=url,
+                        query_hint=kwargs.get("query_hint") or "",
+                        reply_to_message_id=reply_to_message_id,
+                        kwargs=kwargs,
+                    )
 
     elif action == "link":
         if "http" not in urls_values:
@@ -1525,7 +1812,16 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "proxy": search_data.get("proxy"),
             "query_hint": search_data.get("query"),
         }
-        schedule_download_task(kwargs)
+        await admit_and_schedule_download(
+            context=context,
+            chat_id=chat_id,
+            user_id=user_id,
+            request_type="search_choice_download",
+            url=selected_choice["url"],
+            query_hint=search_data.get("query") or "",
+            reply_to_message_id=search_data["reply_to_message_id"],
+            kwargs=kwargs,
+        )
         return
     # Legacy callback payloads: "<message_id> <action>".
     url_message_id = callback_parts[0]
@@ -1595,7 +1891,16 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await safe_send_chat_action(context.bot, stage="ask_dl_record_voice", chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                 # Run heavy task in separate process, "fire and forget":
                 # EXECUTOR.submit(download_url_and_send, **kwargs)
-                schedule_download_task(kwargs)
+                await admit_and_schedule_download(
+                    context=context,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    request_type="ask_dl_download",
+                    url=url,
+                    query_hint="",
+                    reply_to_message_id=int(url_message_id),
+                    kwargs=kwargs,
+                )
 
         elif button_action == "link":
             await safe_send_message(
@@ -1947,11 +2252,111 @@ def ydl_download_audio_fallback(url, download_dir, source_ip=None, proxy=None):
         return False
 
 
-def schedule_download_task(kwargs):
+def schedule_download_task(kwargs, *, job_id: str | None = None):
     """Schedule a download task on the configured executor backend."""
-    if EXECUTOR_KIND == "process":
-        return EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
-    return EXECUTOR.schedule(download_url_and_send, kwargs=kwargs)
+    if is_shutdown_requested():
+        if job_id:
+            RUNTIME_ADMISSION.finish_job(job_id)
+            update_runtime_control_metrics()
+        return None
+    try:
+        if EXECUTOR_KIND == "process":
+            future = EXECUTOR.schedule(download_url_and_send, kwargs=kwargs, timeout=DL_TIMEOUT)
+        else:
+            future = EXECUTOR.schedule(download_url_and_send, kwargs=kwargs)
+    except Exception:
+        if job_id:
+            RUNTIME_ADMISSION.finish_job(job_id)
+            update_runtime_control_metrics()
+        raise
+    if job_id and hasattr(future, "add_done_callback"):
+        def _finish_job(_future):
+            RUNTIME_ADMISSION.finish_job(job_id)
+            update_runtime_control_metrics()
+
+        future.add_done_callback(_finish_job)
+    return future
+
+
+async def admit_and_schedule_download(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    request_type: str,
+    url: str,
+    query_hint: str,
+    reply_to_message_id: int | None,
+    kwargs: dict,
+) -> bool:
+    decision = await check_request_admission(
+        context=context,
+        chat_id=chat_id,
+        user_id=user_id,
+        request_type=request_type,
+        query=query_hint,
+        url=url,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if not decision.allowed:
+        return False
+    job_id = RUNTIME_ADMISSION.register_job(
+        job_type="download",
+        user_id=user_id,
+        chat_id=chat_id,
+        request_type=request_type,
+        query_preview=_safe_log_query(query_hint),
+        url_preview=safe_url_preview(url),
+    )
+    if not job_id:
+        await safe_send_message(
+            context.bot,
+            stage="download_shutdown_gate",
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text="Бот завершает работу, новые задачи временно не принимаются.",
+        )
+        update_runtime_control_metrics()
+        return False
+    update_runtime_control_metrics()
+    try:
+        future = schedule_download_task(kwargs, job_id=job_id)
+    except Exception:
+        RUNTIME_ADMISSION.finish_job(job_id)
+        update_runtime_control_metrics()
+        logger.warning(
+            "download scheduling failed chat_id=%s user_id=%s",
+            chat_id,
+            user_id,
+            extra={"event": "download_schedule_failed", "status": "error"},
+            exc_info=True,
+        )
+        await safe_send_message(
+            context.bot,
+            stage="download_schedule_failed",
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text="Не удалось поставить задачу в очередь. Попробуйте позже.",
+        )
+        return False
+    if not future:
+        await safe_send_message(
+            context.bot,
+            stage="download_schedule_rejected",
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            text="Бот завершает работу, задача не была поставлена в очередь.",
+        )
+        return False
+    log_pipeline_event(
+        "download_job_scheduled",
+        chat_id=chat_id,
+        user_id=user_id,
+        request_type=request_type,
+        url=url,
+        status="queued",
+    )
+    return True
 
 
 def download_url_and_send(
@@ -2597,6 +3002,8 @@ def download_url_and_send(
 
 def get_runtime_snapshot() -> dict:
     snapshot = RUNTIME_STATE.snapshot()
+    jobs_snapshot = RUNTIME_ADMISSION.active_jobs_snapshot()
+    shutdown_snapshot = RUNTIME_ADMISSION.shutdown_snapshot()
     snapshot.update(
         {
             "ready": bool(snapshot.get("ready")),
@@ -2606,6 +3013,23 @@ def get_runtime_snapshot() -> dict:
             "healthcheck_port": HEALTHCHECK_PORT,
             "executor_kind": EXECUTOR_KIND,
             "pending_tasks": get_executor_pending_count(EXECUTOR),
+            "mode": _runtime_mode(),
+            "workers": WORKERS,
+            "active_jobs_total": jobs_snapshot.get("total", 0),
+            "active_jobs_by_type": jobs_snapshot.get("by_type", {}),
+            "shutdown_requested": bool(shutdown_snapshot.get("shutdown_requested")),
+            "shutdown_started_at": shutdown_snapshot.get("shutdown_started_at", 0),
+            "limits": {
+                "user": MAX_ACTIVE_JOBS_PER_USER,
+                "chat": MAX_ACTIVE_JOBS_PER_CHAT,
+                "global": MAX_GLOBAL_ACTIVE_JOBS,
+            },
+            "cooldowns": {
+                "user_seconds": USER_REQUEST_COOLDOWN_SECONDS,
+                "chat_seconds": CHAT_REQUEST_COOLDOWN_SECONDS,
+                "burst_limit": BURST_REQUEST_LIMIT,
+                "burst_window_seconds": BURST_WINDOW_SECONDS,
+            },
         }
     )
     return snapshot
@@ -2630,16 +3054,78 @@ def run_dl_dir_maintenance(stage: str) -> None:
         )
 
 
+def log_startup_mode_and_warnings() -> None:
+    mode = _runtime_mode()
+    if mode == "webhook":
+        logger.info(
+            "startup mode=webhook host=%s port=%s path_configured=%s",
+            WEBHOOK_HOST,
+            WEBHOOK_PORT,
+            bool(WEBHOOK_APP_URL_PATH),
+            extra={"event": "startup_mode", "status": "ok"},
+        )
+        if not WEBHOOK_APP_URL_ROOT:
+            logger.warning("webhook enabled but WEBHOOK_APP_URL_ROOT is empty", extra={"event": "startup_warning", "status": "warn"})
+        if not WEBHOOK_APP_URL_PATH:
+            logger.warning("webhook enabled but WEBHOOK_APP_URL_PATH is empty", extra={"event": "startup_warning", "status": "warn"})
+    else:
+        logger.info(
+            "startup mode=polling (run only one instance per bot token)",
+            extra={"event": "startup_mode", "status": "ok"},
+        )
+
+    if TG_BOT_API_LOCAL_MODE and not ("127.0.0.1" in TG_BOT_API or "localhost" in TG_BOT_API):
+        logger.warning(
+            "local mode enabled but TG_BOT_API seems remote: %s",
+            TG_BOT_API,
+            extra={"event": "startup_warning", "status": "warn"},
+        )
+    if (not TG_BOT_API_LOCAL_MODE) and ("127.0.0.1" in TG_BOT_API or "localhost" in TG_BOT_API):
+        logger.warning(
+            "local Telegram API URL is used while local mode disabled",
+            extra={"event": "startup_warning", "status": "warn"},
+        )
+    if EXECUTOR_KIND == "process" and WORKERS > 4:
+        logger.warning(
+            "process executor with WORKERS=%s may be heavy for memory",
+            WORKERS,
+            extra={"event": "startup_warning", "status": "warn"},
+        )
+    if WORKERS > 8:
+        logger.warning(
+            "WORKERS=%s may be high for this runtime profile",
+            WORKERS,
+            extra={"event": "startup_warning", "status": "warn"},
+        )
+
+
 async def post_shutdown(application: Application) -> None:
+    global POST_SHUTDOWN_DONE
+    with POST_SHUTDOWN_LOCK:
+        if POST_SHUTDOWN_DONE:
+            logger.info("post_shutdown already handled", extra={"event": "shutdown", "status": "already_done"})
+            return
+        POST_SHUTDOWN_DONE = True
+    request_shutdown(reason="post_shutdown", actor="system")
     RUNTIME_STATE.set_ready(False)
+    update_runtime_control_metrics()
+    jobs_snapshot = RUNTIME_ADMISSION.active_jobs_snapshot()
+    logger.info(
+        "post_shutdown active_jobs_total=%s",
+        jobs_snapshot.get("total", 0),
+        extra={"event": "shutdown", "status": "start"},
+    )
     if HEALTHCHECK_SERVER:
         try:
             HEALTHCHECK_SERVER.shutdown()
         except Exception:
             logger.warning("healthcheck shutdown failed", exc_info=True)
     # EXECUTOR.shutdown(wait=False, cancel_futures=True)
-    EXECUTOR.stop()
-    EXECUTOR.join(timeout=10)
+    try:
+        EXECUTOR.stop()
+        EXECUTOR.join(timeout=10)
+    except Exception:
+        logger.warning("executor shutdown failed", extra={"event": "shutdown", "status": "error"}, exc_info=True)
 
 
 async def post_init(application: Application) -> None:
@@ -2647,10 +3133,13 @@ async def post_init(application: Application) -> None:
     SYSTEMD_NOTIFIER.notify(f"STATUS=Application initialized")
     RUNTIME_STATE.set_ready(True)
     RUNTIME_STATE.mark_monitor_tick()
+    update_runtime_control_metrics()
     commands = [
         BotCommand("start", "Запуск и кнопки команд"),
         BotCommand("help", "Справка"),
         BotCommand("settings", "Настройки"),
+        BotCommand("status", "Статус бота"),
+        BotCommand("jobs", "Активные задачи (владелец)"),
         BotCommand("search", "Поиск трека"),
         BotCommand("dl", "Скачать по ссылке"),
         BotCommand("link", "Показать прямые ссылки"),
@@ -2677,6 +3166,7 @@ async def callback_watchdog(context: ContextTypes.DEFAULT_TYPE):
     snapshot = RUNTIME_STATE.snapshot()
     LAST_MONITOR_TICK_TS.set(snapshot["last_monitor_tick"])
     APP_UPTIME_SECONDS.set(snapshot["uptime_seconds"])
+    update_runtime_control_metrics()
     SYSTEMD_NOTIFIER.notify("WATCHDOG=1")
     SYSTEMD_NOTIFIER.notify(f"STATUS=Watchdog was sent {datetime.datetime.now()}")
 
@@ -2686,17 +3176,20 @@ async def callback_monitor(context: ContextTypes.DEFAULT_TYPE):
     summary = summarize_executor(EXECUTOR)
     pending = int(summary.get("pending_tasks", 0))
     snapshot = RUNTIME_STATE.snapshot()
+    jobs_snapshot = RUNTIME_ADMISSION.active_jobs_snapshot()
     logger.info(
-        "monitor executor=%s pending=%s uptime=%s",
+        "monitor executor=%s pending=%s uptime=%s active_jobs=%s",
         summary.get("executor_class"),
         pending,
         snapshot["uptime_seconds"],
+        jobs_snapshot.get("total", 0),
         extra={"event": "monitor_tick", "status": "ok"},
     )
     EXECUTOR_TASKS_REMAINING.set(pending)
     LAST_MONITOR_TICK_TS.set(snapshot["last_monitor_tick"])
     APP_UPTIME_SECONDS.set(snapshot["uptime_seconds"])
     LAST_ERROR_TS_GAUGE.set(snapshot["last_error_ts"] or 0)
+    update_runtime_control_metrics()
     run_dl_dir_maintenance("monitor")
 
 
@@ -2705,6 +3198,8 @@ def main():
 
     # Start exposing Prometheus/OpenMetrics metrics:
     prometheus_client.start_http_server(addr=METRICS_HOST, port=METRICS_PORT, registry=REGISTRY)
+    log_startup_mode_and_warnings()
+    update_runtime_control_metrics()
     run_dl_dir_maintenance("startup")
 
     if HEALTHCHECK_ENABLE:
@@ -2790,6 +3285,8 @@ def main():
     start_command_handler = CommandHandler("start", start_help_commands_callback, block=False)
     help_command_handler = CommandHandler("help", start_help_commands_callback, block=False)
     settings_command_handler = CommandHandler("settings", settings_command_callback, block=False)
+    status_command_handler = CommandHandler("status", status_command_callback, block=False)
+    jobs_command_handler = CommandHandler("jobs", jobs_command_callback, block=False)
     restart_command_handler = CommandHandler("restart", restart_command_callback, block=False)
     search_command_handler = CommandHandler("search", search_command_callback, block=False)
     dl_command_handler = CommandHandler("dl", dl_link_commands_and_messages_callback, filters=~filters.UpdateType.EDITED_MESSAGE & ~filters.FORWARDED, block=False)
@@ -2821,6 +3318,8 @@ def main():
     application.add_handler(start_command_handler)
     application.add_handler(help_command_handler)
     application.add_handler(settings_command_handler)
+    application.add_handler(status_command_handler)
+    application.add_handler(jobs_command_handler)
     application.add_handler(restart_command_handler)
     application.add_handler(search_command_handler)
     application.add_handler(dl_command_handler)
