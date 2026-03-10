@@ -78,6 +78,15 @@ from scdlbot.quality_fallback import (
     find_better_source,
     inspect_local_audio_quality,
 )
+from scdlbot.runtime_ops import (
+    JsonLogFormatter,
+    RuntimeState,
+    cleanup_dl_dir,
+    get_executor_pending_count,
+    safe_url_preview,
+    start_healthcheck_server,
+    summarize_executor,
+)
 from scdlbot.search_logic import (
     VK_AUDIO_ID_PATH_RE,
     build_query_from_message_text,
@@ -216,13 +225,43 @@ BOT_REQUESTS = prometheus_client.Counter(
     labelnames=["type", "chat_type", "mode"],
     registry=REGISTRY,
 )
+APP_UPTIME_SECONDS = prometheus_client.Gauge(
+    "app_uptime_seconds",
+    "Application uptime in seconds",
+    registry=REGISTRY,
+)
+LAST_MONITOR_TICK_TS = prometheus_client.Gauge(
+    "app_last_monitor_tick_ts",
+    "Last monitor tick epoch seconds",
+    registry=REGISTRY,
+)
+LAST_ERROR_TS_GAUGE = prometheus_client.Gauge(
+    "app_last_error_ts",
+    "Last error epoch seconds",
+    registry=REGISTRY,
+)
 
 # Logging:
 logging_handlers = []
 LOGLEVEL = os.getenv("LOGLEVEL", "INFO").upper()
+LOG_JSON = bool(int(os.getenv("LOG_JSON", "0")))
 HOSTNAME = os.getenv("HOSTNAME", "scdlbot-host")
 
-console_formatter = logging.Formatter("[%(name)s] %(levelname)s: %(message)s")
+HEALTHCHECK_ENABLE = bool(int(os.getenv("HEALTHCHECK_ENABLE", "0")))
+HEALTHCHECK_HOST = os.getenv("HEALTHCHECK_HOST", "127.0.0.1")
+HEALTHCHECK_PORT = int(os.getenv("HEALTHCHECK_PORT", "8080"))
+
+TEMP_FILE_TTL_SECONDS = int(os.getenv("TEMP_FILE_TTL_SECONDS", "86400"))
+DL_DIR_MAX_BYTES = int(os.getenv("DL_DIR_MAX_BYTES", "0"))
+DL_DIR_MAX_FILE_COUNT = int(os.getenv("DL_DIR_MAX_FILE_COUNT", "0"))
+RESTART_COOLDOWN_SECONDS = int(os.getenv("RESTART_COOLDOWN_SECONDS", "30"))
+RESTART_STATE_FILE = os.path.expanduser(os.getenv("RESTART_STATE_FILE", "/tmp/scdlbot_restart_ts"))
+
+console_formatter: logging.Formatter
+if LOG_JSON:
+    console_formatter = JsonLogFormatter()
+else:
+    console_formatter = logging.Formatter("[%(name)s] %(levelname)s: %(message)s")
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(console_formatter)
 console_handler.setLevel(LOGLEVEL)
@@ -248,6 +287,9 @@ logging.basicConfig(
     handlers=logging_handlers,
 )
 logger = logging.getLogger(__name__)
+
+RUNTIME_STATE = RuntimeState()
+HEALTHCHECK_SERVER = None
 
 # Systemd watchdog monitoring:
 SYSTEMD_NOTIFIER = sdnotify.SystemdNotifier()
@@ -397,6 +439,25 @@ def _safe_log_query(query: str | None) -> str:
 
 def log_pipeline_event(stage: str, **context):
     """Log pipeline stage with compact structured context fields."""
+    extra = {"event": stage}
+    if context.get("chat_id") is not None:
+        extra["chat_id"] = context["chat_id"]
+    if context.get("user_id") is not None:
+        extra["user_id"] = context["user_id"]
+    if context.get("request_type") is not None:
+        extra["request_type"] = context["request_type"]
+    if context.get("source"):
+        extra["source"] = str(context["source"])
+    if context.get("status"):
+        extra["status"] = str(context["status"])
+    if context.get("query"):
+        extra["query_preview"] = _safe_log_query(str(context["query"]))
+    if context.get("url"):
+        extra["url_preview"] = safe_url_preview(str(context["url"]))
+    if context.get("source_url"):
+        extra["url_preview"] = safe_url_preview(str(context["source_url"]))
+    if context.get("selected_source"):
+        extra["source"] = safe_url_preview(str(context["selected_source"]))
     fields = []
     for key, value in context.items():
         if value is None:
@@ -410,53 +471,100 @@ def log_pipeline_event(stage: str, **context):
         fields.append(f"{key}={value}")
     suffix = " ".join(fields)
     if suffix:
-        logger.info("stage=%s %s", stage, suffix)
+        logger.info("stage=%s %s", stage, suffix, extra=extra)
     else:
-        logger.info("stage=%s", stage)
+        logger.info("stage=%s", stage, extra=extra)
 
 
 async def safe_send_message(bot: Bot, *, stage: str, **kwargs):
     """Send Telegram message with guarded error logging."""
     try:
-        return await bot.send_message(**kwargs)
+        result = await bot.send_message(**kwargs)
+        RUNTIME_STATE.mark_success()
+        return result
     except TelegramError:
         logger.warning(
             "telegram_send_message_failed stage=%s chat_id=%s message_id=%s",
             stage,
             kwargs.get("chat_id"),
             kwargs.get("reply_to_message_id"),
+            extra={
+                "event": "telegram_send_message_failed",
+                "chat_id": kwargs.get("chat_id"),
+                "status": "error",
+            },
             exc_info=True,
         )
+        RUNTIME_STATE.mark_error()
         return None
 
 
 async def safe_edit_message_text(bot: Bot, *, stage: str, **kwargs):
     """Edit Telegram message with guarded error logging."""
     try:
-        return await bot.edit_message_text(**kwargs)
+        result = await bot.edit_message_text(**kwargs)
+        RUNTIME_STATE.mark_success()
+        return result
     except TelegramError:
         logger.warning(
             "telegram_edit_message_failed stage=%s chat_id=%s message_id=%s",
             stage,
             kwargs.get("chat_id"),
             kwargs.get("message_id"),
+            extra={
+                "event": "telegram_edit_message_failed",
+                "chat_id": kwargs.get("chat_id"),
+                "status": "error",
+            },
             exc_info=True,
         )
+        RUNTIME_STATE.mark_error()
         return None
 
 
 async def safe_delete_message(bot: Bot, *, stage: str, **kwargs):
     """Delete Telegram message with guarded error logging."""
     try:
-        return await bot.delete_message(**kwargs)
+        result = await bot.delete_message(**kwargs)
+        RUNTIME_STATE.mark_success()
+        return result
     except TelegramError:
         logger.warning(
             "telegram_delete_message_failed stage=%s chat_id=%s message_id=%s",
             stage,
             kwargs.get("chat_id"),
             kwargs.get("message_id"),
+            extra={
+                "event": "telegram_delete_message_failed",
+                "chat_id": kwargs.get("chat_id"),
+                "status": "error",
+            },
             exc_info=True,
         )
+        RUNTIME_STATE.mark_error()
+        return None
+
+
+async def safe_send_chat_action(bot: Bot, *, stage: str, **kwargs):
+    """Send chat action with guarded error logging."""
+    try:
+        result = await bot.send_chat_action(**kwargs)
+        RUNTIME_STATE.mark_success()
+        return result
+    except TelegramError:
+        logger.warning(
+            "telegram_send_chat_action_failed stage=%s chat_id=%s action=%s",
+            stage,
+            kwargs.get("chat_id"),
+            kwargs.get("action"),
+            extra={
+                "event": "telegram_send_chat_action_failed",
+                "chat_id": kwargs.get("chat_id"),
+                "status": "error",
+            },
+            exc_info=True,
+        )
+        RUNTIME_STATE.mark_error()
         return None
 
 
@@ -487,6 +595,48 @@ def cleanup_expired_search_choice_cache(chat_data: dict, *, chat_id: int | None 
             user_id=user_id,
             removed=removed,
         )
+
+
+def _read_restart_marker_ts() -> float:
+    try:
+        with open(RESTART_STATE_FILE, "r", encoding="utf-8") as marker_file:
+            return float(marker_file.read().strip() or "0")
+    except Exception:
+        return 0.0
+
+
+def _write_restart_marker_ts(ts: float) -> None:
+    try:
+        with open(RESTART_STATE_FILE, "w", encoding="utf-8") as marker_file:
+            marker_file.write(str(ts))
+    except Exception:
+        logger.warning("could not write restart marker file", exc_info=True)
+
+
+def get_restart_cooldown_remaining(now_ts: float | None = None) -> int:
+    now_value = now_ts if now_ts is not None else time.time()
+    snapshot = RUNTIME_STATE.snapshot()
+    last_local = float(snapshot.get("last_restart_request_ts") or 0.0)
+    last_marker = _read_restart_marker_ts()
+    last_restart_ts = max(last_local, last_marker)
+    if last_restart_ts <= 0:
+        return 0
+    remaining = RESTART_COOLDOWN_SECONDS - int(now_value - last_restart_ts)
+    return max(0, remaining)
+
+
+def request_restart(*, reason: str, actor_user_id: int | None = None, chat_id: int | None = None):
+    now_ts = time.time()
+    _write_restart_marker_ts(now_ts)
+    RUNTIME_STATE.mark_restart_request()
+    log_pipeline_event(
+        "restart_requested",
+        chat_id=chat_id,
+        user_id=actor_user_id,
+        status="ok",
+        source=reason,
+    )
+    os.execv(sys.executable, [sys.executable, "-m", "scdlbot"])
 
 
 def get_settings_inline_keyboard(chat_data):
@@ -563,6 +713,7 @@ async def start_help_commands_callback(update: Update, context: ContextTypes.DEF
         message = update.message
     if not message:
         return
+    RUNTIME_STATE.mark_success()
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     command_name = "help"
@@ -629,19 +780,33 @@ async def restart_command_callback(update: Update, context: ContextTypes.DEFAULT
     logger.info("received command: %s chat_id=%s user_id=%s", command_name, chat_id, user_id)
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     if user_id != TG_BOT_OWNER_CHAT_ID:
-        await context.bot.send_message(
+        await safe_send_message(
+            context.bot,
+            stage="restart_not_owner",
             chat_id=chat_id,
             reply_to_message_id=message.message_id if message else None,
             text="Перезапуск доступен только владельцу бота.",
         )
         return
-    await context.bot.send_message(
+    cooldown_remaining = get_restart_cooldown_remaining()
+    if cooldown_remaining > 0:
+        await safe_send_message(
+            context.bot,
+            stage="restart_cooldown",
+            chat_id=chat_id,
+            reply_to_message_id=message.message_id if message else None,
+            text=f"Перезапуск уже запрошен недавно. Подождите {cooldown_remaining} сек.",
+        )
+        return
+    await safe_send_message(
+        context.bot,
+        stage="restart_ack",
         chat_id=chat_id,
         reply_to_message_id=message.message_id if message else None,
         text="Перезапускаю бота...",
     )
     await asyncio.sleep(0.2)
-    os.execv(sys.executable, [sys.executable, "-m", "scdlbot"])
+    request_restart(reason="owner_command", actor_user_id=user_id, chat_id=chat_id)
 
 
 def get_search_choice_inline_keyboard(search_token: str, choices: list[dict]) -> InlineKeyboardMarkup:
@@ -812,6 +977,7 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id if update.effective_user else 0
     request_id = uuid4().hex[:8]
+    RUNTIME_STATE.mark_success()
     if not chat_allowed(chat_id):
         await safe_send_message(context.bot, stage="search_not_allowed", chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
@@ -837,7 +1003,7 @@ async def run_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q
     BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
     source_ip = random.choice(SOURCE_IPS) if SOURCE_IPS else None
     proxy = random.choice(PROXIES) if PROXIES else None
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    await safe_send_chat_action(context.bot, stage="search_typing", chat_id=chat_id, action=ChatAction.TYPING)
     wait_message = await safe_send_message(
         context.bot,
         stage="search_wait_message",
@@ -1013,6 +1179,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     user_id = update.effective_user.id if update.effective_user else 0
+    RUNTIME_STATE.mark_success()
     if not chat_allowed(chat_id):
         await context.bot.send_message(chat_id=chat_id, text="Эта команда недоступна в этом чате.")
         return
@@ -1068,7 +1235,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     if not is_usable_query(query_hint):
         query_hint = ""
     if action in ["dl", "link"]:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        await safe_send_chat_action(context.bot, stage="dl_link_wait_typing", chat_id=chat_id, action=ChatAction.TYPING)
         wait_message = await safe_send_message(
             context.bot,
             stage="links_wait_message",
@@ -1146,20 +1313,55 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                     parse_mode="Markdown",
                 )
         else:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await safe_send_chat_action(context.bot, stage="dl_action_typing", chat_id=chat_id, action=ChatAction.TYPING)
             for url in urls_dict:
                 direct_urls_status = urls_dict[url]
                 if direct_urls_status in ["failed", "restrict_direct", "restrict_region", "restrict_live", "timeout"]:
                     if direct_urls_status == "failed":
-                        await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=FAILED_TEXT, parse_mode="Markdown")
+                        await safe_send_message(
+                            context.bot,
+                            stage="dl_failed_status",
+                            chat_id=chat_id,
+                            reply_to_message_id=reply_to_message_id,
+                            text=FAILED_TEXT,
+                            parse_mode="Markdown",
+                        )
                     elif direct_urls_status == "timeout":
-                        await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=DL_TIMEOUT_TEXT, parse_mode="Markdown")
+                        await safe_send_message(
+                            context.bot,
+                            stage="dl_timeout_status",
+                            chat_id=chat_id,
+                            reply_to_message_id=reply_to_message_id,
+                            text=DL_TIMEOUT_TEXT,
+                            parse_mode="Markdown",
+                        )
                     elif direct_urls_status == "restrict_direct":
-                        await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=DIRECT_RESTRICTION_TEXT, parse_mode="Markdown")
+                        await safe_send_message(
+                            context.bot,
+                            stage="dl_restrict_direct_status",
+                            chat_id=chat_id,
+                            reply_to_message_id=reply_to_message_id,
+                            text=DIRECT_RESTRICTION_TEXT,
+                            parse_mode="Markdown",
+                        )
                     elif direct_urls_status == "restrict_region":
-                        await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=REGION_RESTRICTION_TEXT, parse_mode="Markdown")
+                        await safe_send_message(
+                            context.bot,
+                            stage="dl_restrict_region_status",
+                            chat_id=chat_id,
+                            reply_to_message_id=reply_to_message_id,
+                            text=REGION_RESTRICTION_TEXT,
+                            parse_mode="Markdown",
+                        )
                     elif direct_urls_status == "restrict_live":
-                        await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=LIVE_RESTRICTION_TEXT, parse_mode="Markdown")
+                        await safe_send_message(
+                            context.bot,
+                            stage="dl_restrict_live_status",
+                            chat_id=chat_id,
+                            reply_to_message_id=reply_to_message_id,
+                            text=LIVE_RESTRICTION_TEXT,
+                            parse_mode="Markdown",
+                        )
                 else:
                     kwargs = {
                         "bot_options": {
@@ -1186,7 +1388,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                             )
                         ),
                     }
-                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+                    await safe_send_chat_action(context.bot, stage="dl_action_record_voice", chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                     # Run heavy task in separate process, "fire and forget":
                     # EXECUTOR.submit(download_url_and_send, **kwargs)
                     schedule_download_task(kwargs)
@@ -1203,7 +1405,7 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
                     parse_mode="Markdown",
                 )
         else:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await safe_send_chat_action(context.bot, stage="link_action_typing", chat_id=chat_id, action=ChatAction.TYPING)
             await safe_send_message(
                 context.bot,
                 stage="links_action_link_result",
@@ -1214,7 +1416,14 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
     elif action == "ask":
         if "http" not in urls_values:
             if apologize:
-                await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, text=NO_URLS_TEXT, parse_mode="Markdown")
+                await safe_send_message(
+                    context.bot,
+                    stage="ask_no_urls",
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    text=NO_URLS_TEXT,
+                    parse_mode="Markdown",
+                )
         else:
             url_message_id = str(reply_to_message_id)
             context.chat_data[url_message_id] = {"urls": urls_dict, "source_ip": source_ip, "proxy": proxy}
@@ -1223,7 +1432,14 @@ async def dl_link_commands_and_messages_callback(update: Update, context: Contex
             button_link = InlineKeyboardButton(text="🔗️ Показать ссылки", callback_data=" ".join([url_message_id, "link"]))
             button_cancel = InlineKeyboardButton(text="❌ Отмена", callback_data=" ".join([url_message_id, "cancel"]))
             inline_keyboard = InlineKeyboardMarkup([[button_dl, button_link, button_cancel]])
-            await context.bot.send_message(chat_id=chat_id, reply_to_message_id=reply_to_message_id, reply_markup=inline_keyboard, text=question)
+            await safe_send_message(
+                context.bot,
+                stage="ask_choice_message",
+                chat_id=chat_id,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=inline_keyboard,
+                text=question,
+            )
 
 
 async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1234,6 +1450,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
     callback_data = (update.callback_query.data or "").strip()
+    RUNTIME_STATE.mark_success()
     callback_parts = callback_data.split()
     cleanup_expired_search_choice_cache(context.chat_data, chat_id=chat_id, user_id=user_id)
     if len(callback_parts) < 2:
@@ -1326,7 +1543,7 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.debug(command_name)
         BOT_REQUESTS.labels(type=command_name, chat_type=chat_type, mode="None").inc()
         if button_action == "close":
-            await context.bot.delete_message(chat_id, button_message_id)
+            await safe_delete_message(context.bot, stage="settings_close", chat_id=chat_id, message_id=button_message_id)
         else:
             setting_changed = False
             if button_action in ["dl", "link", "ask"]:
@@ -1375,19 +1592,27 @@ async def button_press_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     "proxy": url_message_data["proxy"],
                     "query_hint": None,
                 }
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+                await safe_send_chat_action(context.bot, stage="ask_dl_record_voice", chat_id=chat_id, action=ChatAction.RECORD_VOICE)
                 # Run heavy task in separate process, "fire and forget":
                 # EXECUTOR.submit(download_url_and_send, **kwargs)
                 schedule_download_task(kwargs)
 
         elif button_action == "link":
-            await context.bot.send_message(chat_id=chat_id, reply_to_message_id=url_message_id, parse_mode="Markdown", disable_web_page_preview=True, text=get_link_text(urls_dict))
-            await context.bot.delete_message(chat_id=chat_id, message_id=button_message_id)
+            await safe_send_message(
+                context.bot,
+                stage="ask_link_result",
+                chat_id=chat_id,
+                reply_to_message_id=url_message_id,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+                text=get_link_text(urls_dict),
+            )
+            await safe_delete_message(context.bot, stage="ask_link_delete_prompt", chat_id=chat_id, message_id=button_message_id)
         elif button_action == "cancel":
-            await context.bot.delete_message(chat_id=chat_id, message_id=button_message_id)
+            await safe_delete_message(context.bot, stage="ask_cancel_prompt", chat_id=chat_id, message_id=button_message_id)
     else:
         await update.callback_query.answer(text=OLD_MSG_TEXT)
-        await context.bot.delete_message(chat_id=chat_id, message_id=button_message_id)
+        await safe_delete_message(context.bot, stage="callback_old_message_cleanup", chat_id=chat_id, message_id=button_message_id)
 
 
 async def blacklist_whitelist_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1419,13 +1644,21 @@ async def error_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):  #
     # https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/errorhandlerbot.py#L29
     # TODO send telegram message to bot owner as well
     # Log the error before we do anything else, so we can see it even if something breaks.
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    RUNTIME_STATE.mark_error()
+    LAST_ERROR_TS_GAUGE.set(time.time())
+    error_type = type(context.error).__name__ if context.error else "Exception"
+    logger.error(
+        "Exception while handling update type=%s",
+        error_type,
+        extra={"event": "update_error", "status": "error"},
+        exc_info=context.error,
+    )
 
     # traceback.format_exception returns the usual python message about an exception, but as a
     # list of strings rather than a single string, so we have to join them together.
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
     tb_string = "".join(tb_list)
-    logger.debug(tb_string)
+    logger.debug(tb_string, extra={"event": "update_error_traceback"})
 
     # try:
     #     raise context.error
@@ -2362,7 +2595,48 @@ def download_url_and_send(
     run_async(bot.shutdown())
 
 
+def get_runtime_snapshot() -> dict:
+    snapshot = RUNTIME_STATE.snapshot()
+    snapshot.update(
+        {
+            "ready": bool(snapshot.get("ready")),
+            "log_json": LOG_JSON,
+            "healthcheck_enable": HEALTHCHECK_ENABLE,
+            "healthcheck_host": HEALTHCHECK_HOST,
+            "healthcheck_port": HEALTHCHECK_PORT,
+            "executor_kind": EXECUTOR_KIND,
+            "pending_tasks": get_executor_pending_count(EXECUTOR),
+        }
+    )
+    return snapshot
+
+
+def run_dl_dir_maintenance(stage: str) -> None:
+    try:
+        cleanup_dl_dir(
+            DL_DIR,
+            ttl_seconds=TEMP_FILE_TTL_SECONDS,
+            max_total_bytes=DL_DIR_MAX_BYTES,
+            max_file_count=DL_DIR_MAX_FILE_COUNT,
+            logger=logger,
+        )
+    except Exception:
+        logger.warning(
+            "dl_dir maintenance failed stage=%s dir=%s",
+            stage,
+            DL_DIR,
+            extra={"event": "dl_dir_cleanup_failed", "status": "error"},
+            exc_info=True,
+        )
+
+
 async def post_shutdown(application: Application) -> None:
+    RUNTIME_STATE.set_ready(False)
+    if HEALTHCHECK_SERVER:
+        try:
+            HEALTHCHECK_SERVER.shutdown()
+        except Exception:
+            logger.warning("healthcheck shutdown failed", exc_info=True)
     # EXECUTOR.shutdown(wait=False, cancel_futures=True)
     EXECUTOR.stop()
     EXECUTOR.join(timeout=10)
@@ -2371,6 +2645,8 @@ async def post_shutdown(application: Application) -> None:
 async def post_init(application: Application) -> None:
     SYSTEMD_NOTIFIER.notify("READY=1")
     SYSTEMD_NOTIFIER.notify(f"STATUS=Application initialized")
+    RUNTIME_STATE.set_ready(True)
+    RUNTIME_STATE.mark_monitor_tick()
     commands = [
         BotCommand("start", "Запуск и кнопки команд"),
         BotCommand("help", "Справка"),
@@ -2397,18 +2673,56 @@ async def post_init(application: Application) -> None:
 
 
 async def callback_watchdog(context: ContextTypes.DEFAULT_TYPE):
+    RUNTIME_STATE.mark_monitor_tick()
+    snapshot = RUNTIME_STATE.snapshot()
+    LAST_MONITOR_TICK_TS.set(snapshot["last_monitor_tick"])
+    APP_UPTIME_SECONDS.set(snapshot["uptime_seconds"])
     SYSTEMD_NOTIFIER.notify("WATCHDOG=1")
     SYSTEMD_NOTIFIER.notify(f"STATUS=Watchdog was sent {datetime.datetime.now()}")
 
 
 async def callback_monitor(context: ContextTypes.DEFAULT_TYPE):
-    logger.debug(f"EXECUTOR pending work items: {len(EXECUTOR._pending_work_items)} tasks remain")
-    EXECUTOR_TASKS_REMAINING.set(len(EXECUTOR._pending_work_items))
+    RUNTIME_STATE.mark_monitor_tick()
+    summary = summarize_executor(EXECUTOR)
+    pending = int(summary.get("pending_tasks", 0))
+    snapshot = RUNTIME_STATE.snapshot()
+    logger.info(
+        "monitor executor=%s pending=%s uptime=%s",
+        summary.get("executor_class"),
+        pending,
+        snapshot["uptime_seconds"],
+        extra={"event": "monitor_tick", "status": "ok"},
+    )
+    EXECUTOR_TASKS_REMAINING.set(pending)
+    LAST_MONITOR_TICK_TS.set(snapshot["last_monitor_tick"])
+    APP_UPTIME_SECONDS.set(snapshot["uptime_seconds"])
+    LAST_ERROR_TS_GAUGE.set(snapshot["last_error_ts"] or 0)
+    run_dl_dir_maintenance("monitor")
 
 
 def main():
+    global HEALTHCHECK_SERVER
+
     # Start exposing Prometheus/OpenMetrics metrics:
     prometheus_client.start_http_server(addr=METRICS_HOST, port=METRICS_PORT, registry=REGISTRY)
+    run_dl_dir_maintenance("startup")
+
+    if HEALTHCHECK_ENABLE:
+        try:
+            HEALTHCHECK_SERVER = start_healthcheck_server(
+                host=HEALTHCHECK_HOST,
+                port=HEALTHCHECK_PORT,
+                get_state=get_runtime_snapshot,
+                logger=logger,
+            )
+        except Exception:
+            logger.warning(
+                "healthcheck server start failed host=%s port=%s",
+                HEALTHCHECK_HOST,
+                HEALTHCHECK_PORT,
+                extra={"event": "healthcheck_start", "status": "error"},
+                exc_info=True,
+            )
 
     # Maybe we can use token again if we will buy SoundCloud Go+
     # https://github.com/flyingrub/scdl/issues/429
@@ -2519,7 +2833,7 @@ def main():
 
     job_queue = application.job_queue
     job_watchdog = job_queue.run_repeating(callback_watchdog, interval=60, first=10)
-    # job_monitor = job_queue.run_repeating(callback_monitor, interval=5, first=5)
+    job_monitor = job_queue.run_repeating(callback_monitor, interval=60, first=20)
 
     if WEBHOOK_ENABLE:
         application.run_webhook(
