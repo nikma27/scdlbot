@@ -35,6 +35,9 @@ echo "Poetry: $(poetry --version)"
 echo "FFmpeg: $(ffmpeg -version | sed -n '1p')"
 echo "BOT_MODE: ${BOT_MODE}"
 
+# Python-level deterministic config/dependency preflight.
+poetry run python -m scdlbot.config_validation --preflight
+
 # Validate key CLI tools are available from Poetry environment.
 poetry run python -c "import shutil; req=['scdl','bandcamp-dl','yt-dlp']; missing=[x for x in req if shutil.which(x) is None]; print('Missing CLI tools: ' + ', '.join(missing) if missing else 'All downloader CLI tools are available.'); raise SystemExit(1 if missing else 0)"
 

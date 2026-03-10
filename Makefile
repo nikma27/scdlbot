@@ -44,6 +44,18 @@ test: lint package
 .PHONY: test_fast
 test_fast: lint package_fast
 
+.PHONY: preflight
+preflight:
+	poetry run python -m scdlbot.config_validation --preflight
+
+.PHONY: smoke_test
+smoke_test:
+	poetry run python -m unittest discover -s tests -p "test_*.py"
+
+.PHONY: run
+run:
+	poetry run python -m scdlbot
+
 .PHONY: cloud_bootstrap
 cloud_bootstrap:
 	bash ./cloud_startup.sh

@@ -32,15 +32,18 @@
 
 ### Caveats
 
-- `TG_BOT_TOKEN` env var is **required** at module import time (`os.environ["TG_BOT_TOKEN"]`), so even importing the module will fail without it.
+- `TG_BOT_TOKEN` env var is required for bot startup; imports can succeed without it, but startup validation will fail fast.
 - Cloud sessions should use `.env.cloud` (copied from `.env.cloud.sample`) and not commit secret values.
-- The `make test` target runs `lint` (currently no-op / commented out) and `package` (`poetry check`, `pip check`, `safety check`). There are no unit tests.
+- The `make test` target runs `lint` (currently no-op / commented out) and `package` (`poetry check`, `pip check`, `safety check`). Lightweight unit smoke tests are available via `make smoke_test`.
 - `make test_fast` is intended for quick feedback in cloud sessions; it skips `poetry check` and vulnerability scan, so run full `make test` before shipping changes.
 - `poetry lock` may be needed if `pyproject.toml` has changed since the lock file was last generated. The update script handles this.
 - The `lint` Makefile target is effectively a no-op (linters are commented out). Formatting is done via `make format` (isort + black).
 - `poetry` is installed to `~/.local/bin`; startup scripts should always export `PATH="$HOME/.local/bin:$PATH"` before running Poetry commands.
 - For production-like cloud verification without long-running process, use `make cloud_dry_run` with `CLOUD_DRY_RUN=1`.
 - Quality fallback can be tuned with `QUALITY_MIN_BITRATE_KBPS`, `PREFER_LOSSLESS`, `ENABLE_CROSS_PLATFORM_SEARCH`, `ENABLE_WEB_FALLBACK`, and `YOUTUBE_MIN_HEIGHT`.
+- Runtime admission/shutdown controls are configurable via `MAX_ACTIVE_JOBS_PER_USER`, `MAX_ACTIVE_JOBS_PER_CHAT`, `MAX_GLOBAL_ACTIVE_JOBS`, `USER_REQUEST_COOLDOWN_SECONDS`, `CHAT_REQUEST_COOLDOWN_SECONDS`, `BURST_REQUEST_LIMIT`, `BURST_WINDOW_SECONDS`, `SHUTDOWN_GRACE_SECONDS`.
+- Optional health/logging controls: `HEALTHCHECK_ENABLE`, `HEALTHCHECK_HOST`, `HEALTHCHECK_PORT`, `LOG_JSON`.
+- Python-level config validation helper is available: `poetry run python -m scdlbot.config_validation --preflight`.
 
 ### Recommended cloud startup script
 

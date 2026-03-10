@@ -74,6 +74,15 @@ or refer directly to the `help message <scdlbot/texts/help.tg.md>`__.
 Please report all bugs and issues and suggest your improvements
 to `issues <https://github.com/gpchelkin/scdlbot/issues>`__.
 
+Production notes for operators
+------------------------------
+
+- Cloud bootstrap/checklist: ``CLOUD_SETUP.md``
+- Runtime operations runbook: ``OPERATIONS.md``
+- Search/fallback flow details: ``SEARCH_WORKFLOW.md``
+
+If you run in polling mode, keep exactly one bot instance per token.
+
 Supported sites and mainly used packages
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

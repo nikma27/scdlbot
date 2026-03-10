@@ -78,6 +78,7 @@ from scdlbot.quality_fallback import (
     find_better_source,
     inspect_local_audio_quality,
 )
+from scdlbot.config_validation import sanitize_mapping_for_log, validate_runtime_config
 from scdlbot.runtime_ops import (
     JsonLogFormatter,
     RuntimeState,
@@ -111,19 +112,36 @@ def pp_initializer(limit):
     # resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
 
 
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).replace("_", ""))
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
 TG_BOT_API = os.getenv("TG_BOT_API", "https://api.telegram.org")
 # https://github.com/python-telegram-bot/python-telegram-bot/wiki/Local-Bot-API-Server
 # https://github.com/tdlib/telegram-bot-api#usage
 TG_BOT_API_LOCAL_MODE = False
 if "TG_BOT_API_LOCAL_MODE" in os.environ:
-    TG_BOT_API_LOCAL_MODE = bool(int(os.getenv("TG_BOT_API_LOCAL_MODE", "0")))
+    TG_BOT_API_LOCAL_MODE = _env_bool("TG_BOT_API_LOCAL_MODE", False)
 elif "127.0.0.1" in TG_BOT_API or "localhost" in TG_BOT_API:
     TG_BOT_API_LOCAL_MODE = True
 HTTP_VERSION = "2"
 if TG_BOT_API_LOCAL_MODE:
     HTTP_VERSION = "1.1"
-TG_BOT_OWNER_CHAT_ID = int(os.getenv("TG_BOT_OWNER_CHAT_ID", "0"))
+TG_BOT_OWNER_CHAT_ID = _env_int("TG_BOT_OWNER_CHAT_ID", 0)
 
 CHAT_STORAGE = os.path.expanduser(os.getenv("CHAT_STORAGE", "/tmp/scdlbot.pickle"))
 DL_DIR = os.path.expanduser(os.getenv("DL_DIR", "/tmp/scdlbot"))
@@ -131,7 +149,7 @@ BIN_PATH = os.getenv("BIN_PATH", "")
 scdl_bin = local[os.path.join(BIN_PATH, "scdl")]
 bcdl_bin = local[os.path.join(BIN_PATH, "bandcamp-dl")]
 BCDL_ENABLE = True
-WORKERS = int(os.getenv("WORKERS", 2))
+WORKERS = _env_int("WORKERS", 2)
 # TODO 'fork' is prohibited, doesn't work. Maybe change to 'spawn' on all platforms
 mp_method = "forkserver"
 if platform.system() == "Windows":
@@ -147,19 +165,19 @@ if EXECUTOR_KIND == "process":
 else:
     # ThreadPool avoids pickling issues for runtime-defined callables in cloud runs.
     EXECUTOR = ThreadPool(max_workers=WORKERS, max_tasks=20)
-DL_TIMEOUT = int(os.getenv("DL_TIMEOUT", 300))
-CHECK_URL_TIMEOUT = int(os.getenv("CHECK_URL_TIMEOUT", 30))
+DL_TIMEOUT = _env_int("DL_TIMEOUT", 300)
+CHECK_URL_TIMEOUT = _env_int("CHECK_URL_TIMEOUT", 30)
 # Timeouts: https://www.python-httpx.org/advanced/
-COMMON_CONNECTION_TIMEOUT = int(os.getenv("COMMON_CONNECTION_TIMEOUT", 10))
-MAX_TG_FILE_SIZE = int(os.getenv("MAX_TG_FILE_SIZE", "45_000_000"))
-MAX_CONVERT_FILE_SIZE = int(os.getenv("MAX_CONVERT_FILE_SIZE", "80_000_000"))
-QUALITY_MIN_BITRATE_KBPS = int(os.getenv("QUALITY_MIN_BITRATE_KBPS", "320"))
-PREFER_LOSSLESS = bool(int(os.getenv("PREFER_LOSSLESS", "1")))
-ENABLE_CROSS_PLATFORM_SEARCH = bool(int(os.getenv("ENABLE_CROSS_PLATFORM_SEARCH", "1")))
-ENABLE_WEB_FALLBACK = bool(int(os.getenv("ENABLE_WEB_FALLBACK", "1")))
-FALLBACK_MAX_CANDIDATES = int(os.getenv("FALLBACK_MAX_CANDIDATES", "8"))
-YOUTUBE_MIN_HEIGHT = int(os.getenv("YOUTUBE_MIN_HEIGHT", "1080"))
-SEARCH_RESULT_LIMIT = int(os.getenv("SEARCH_RESULT_LIMIT", "5"))
+COMMON_CONNECTION_TIMEOUT = _env_int("COMMON_CONNECTION_TIMEOUT", 10)
+MAX_TG_FILE_SIZE = _env_int("MAX_TG_FILE_SIZE", 45_000_000)
+MAX_CONVERT_FILE_SIZE = _env_int("MAX_CONVERT_FILE_SIZE", 80_000_000)
+QUALITY_MIN_BITRATE_KBPS = _env_int("QUALITY_MIN_BITRATE_KBPS", 320)
+PREFER_LOSSLESS = _env_bool("PREFER_LOSSLESS", True)
+ENABLE_CROSS_PLATFORM_SEARCH = _env_bool("ENABLE_CROSS_PLATFORM_SEARCH", True)
+ENABLE_WEB_FALLBACK = _env_bool("ENABLE_WEB_FALLBACK", True)
+FALLBACK_MAX_CANDIDATES = _env_int("FALLBACK_MAX_CANDIDATES", 8)
+YOUTUBE_MIN_HEIGHT = _env_int("YOUTUBE_MIN_HEIGHT", 1080)
+SEARCH_RESULT_LIMIT = _env_int("SEARCH_RESULT_LIMIT", 5)
 NO_FLOOD_CHAT_IDS = list(map(int, os.getenv("NO_FLOOD_CHAT_IDS", "0").split(",")))
 COOKIES_FILE = os.getenv("COOKIES_FILE", None)
 PROXIES = []
@@ -202,9 +220,9 @@ if "BLACKLIST_CHATS" in os.environ:
         raise ValueError("Your blacklisted chats list does not contain valid integers.")
 
 # Webhook:
-WEBHOOK_ENABLE = bool(int(os.getenv("WEBHOOK_ENABLE", "0")))
+WEBHOOK_ENABLE = _env_bool("WEBHOOK_ENABLE", False)
 WEBHOOK_HOST = os.getenv("HOST", "127.0.0.1")
-WEBHOOK_PORT = int(os.getenv("PORT", "5000"))
+WEBHOOK_PORT = _env_int("PORT", 5000)
 WEBHOOK_APP_URL_ROOT = os.getenv("WEBHOOK_APP_URL_ROOT", "")
 WEBHOOK_APP_URL_PATH = os.getenv("WEBHOOK_APP_URL_PATH", TG_BOT_TOKEN.replace(":", ""))
 WEBHOOK_CERT_FILE = os.getenv("WEBHOOK_CERT_FILE", None)
@@ -213,7 +231,7 @@ WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", None)
 
 # Prometheus metrics:
 METRICS_HOST = os.getenv("METRICS_HOST", "127.0.0.1")
-METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
+METRICS_PORT = _env_int("METRICS_PORT", 8000)
 REGISTRY = prometheus_client.CollectorRegistry()
 EXECUTOR_TASKS_REMAINING = prometheus_client.Gauge(
     "executor_tasks_remaining",
@@ -272,27 +290,27 @@ RESTART_REQUESTS_TOTAL = prometheus_client.Counter(
 # Logging:
 logging_handlers = []
 LOGLEVEL = os.getenv("LOGLEVEL", "INFO").upper()
-LOG_JSON = bool(int(os.getenv("LOG_JSON", "0")))
+LOG_JSON = _env_bool("LOG_JSON", False)
 HOSTNAME = os.getenv("HOSTNAME", "scdlbot-host")
 
-HEALTHCHECK_ENABLE = bool(int(os.getenv("HEALTHCHECK_ENABLE", "0")))
+HEALTHCHECK_ENABLE = _env_bool("HEALTHCHECK_ENABLE", False)
 HEALTHCHECK_HOST = os.getenv("HEALTHCHECK_HOST", "127.0.0.1")
-HEALTHCHECK_PORT = int(os.getenv("HEALTHCHECK_PORT", "8080"))
+HEALTHCHECK_PORT = _env_int("HEALTHCHECK_PORT", 8080)
 
-TEMP_FILE_TTL_SECONDS = int(os.getenv("TEMP_FILE_TTL_SECONDS", "86400"))
-DL_DIR_MAX_BYTES = int(os.getenv("DL_DIR_MAX_BYTES", "0"))
-DL_DIR_MAX_FILE_COUNT = int(os.getenv("DL_DIR_MAX_FILE_COUNT", "0"))
-RESTART_COOLDOWN_SECONDS = int(os.getenv("RESTART_COOLDOWN_SECONDS", "30"))
+TEMP_FILE_TTL_SECONDS = _env_int("TEMP_FILE_TTL_SECONDS", 86400)
+DL_DIR_MAX_BYTES = _env_int("DL_DIR_MAX_BYTES", 0)
+DL_DIR_MAX_FILE_COUNT = _env_int("DL_DIR_MAX_FILE_COUNT", 0)
+RESTART_COOLDOWN_SECONDS = _env_int("RESTART_COOLDOWN_SECONDS", 30)
 RESTART_STATE_FILE = os.path.expanduser(os.getenv("RESTART_STATE_FILE", "/tmp/scdlbot_restart_ts"))
-SHUTDOWN_GRACE_SECONDS = int(os.getenv("SHUTDOWN_GRACE_SECONDS", "10"))
+SHUTDOWN_GRACE_SECONDS = _env_int("SHUTDOWN_GRACE_SECONDS", 10)
 
-MAX_ACTIVE_JOBS_PER_USER = int(os.getenv("MAX_ACTIVE_JOBS_PER_USER", "2"))
-MAX_ACTIVE_JOBS_PER_CHAT = int(os.getenv("MAX_ACTIVE_JOBS_PER_CHAT", "4"))
-MAX_GLOBAL_ACTIVE_JOBS = int(os.getenv("MAX_GLOBAL_ACTIVE_JOBS", "8"))
-USER_REQUEST_COOLDOWN_SECONDS = int(os.getenv("USER_REQUEST_COOLDOWN_SECONDS", "3"))
-CHAT_REQUEST_COOLDOWN_SECONDS = int(os.getenv("CHAT_REQUEST_COOLDOWN_SECONDS", "1"))
-BURST_REQUEST_LIMIT = int(os.getenv("BURST_REQUEST_LIMIT", "5"))
-BURST_WINDOW_SECONDS = int(os.getenv("BURST_WINDOW_SECONDS", "20"))
+MAX_ACTIVE_JOBS_PER_USER = _env_int("MAX_ACTIVE_JOBS_PER_USER", 2)
+MAX_ACTIVE_JOBS_PER_CHAT = _env_int("MAX_ACTIVE_JOBS_PER_CHAT", 4)
+MAX_GLOBAL_ACTIVE_JOBS = _env_int("MAX_GLOBAL_ACTIVE_JOBS", 8)
+USER_REQUEST_COOLDOWN_SECONDS = _env_int("USER_REQUEST_COOLDOWN_SECONDS", 3)
+CHAT_REQUEST_COOLDOWN_SECONDS = _env_int("CHAT_REQUEST_COOLDOWN_SECONDS", 1)
+BURST_REQUEST_LIMIT = _env_int("BURST_REQUEST_LIMIT", 5)
+BURST_WINDOW_SECONDS = _env_int("BURST_WINDOW_SECONDS", 20)
 
 console_formatter: logging.Formatter
 if LOG_JSON:
@@ -404,7 +422,7 @@ AUDIO_FORMATS = ["mp3"]
 VIDEO_FORMATS = ["m4a", "mp4", "webm"]
 LOSSLESS_AUDIO_EXTENSIONS = {"flac", "wav", "aiff", "alac", "ape"}
 SEARCH_CHOICE_CACHE_PREFIX = "search_choice:"
-SEARCH_CHOICE_TTL_SECONDS = int(os.getenv("SEARCH_CHOICE_TTL_SECONDS", "900"))
+SEARCH_CHOICE_TTL_SECONDS = _env_int("SEARCH_CHOICE_TTL_SECONDS", 900)
 BTN_HELP = "❓ Помощь"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_SEARCH = "🔎 Поиск"
@@ -3054,6 +3072,66 @@ def run_dl_dir_maintenance(stage: str) -> None:
         )
 
 
+def get_parsed_runtime_config() -> dict:
+    return {
+        "TG_BOT_TOKEN": TG_BOT_TOKEN,
+        "TG_BOT_API": TG_BOT_API,
+        "TG_BOT_API_LOCAL_MODE": TG_BOT_API_LOCAL_MODE,
+        "TG_BOT_OWNER_CHAT_ID": TG_BOT_OWNER_CHAT_ID,
+        "CHAT_STORAGE": CHAT_STORAGE,
+        "DL_DIR": DL_DIR,
+        "WORKERS": WORKERS,
+        "EXECUTOR_KIND": EXECUTOR_KIND,
+        "DL_TIMEOUT": DL_TIMEOUT,
+        "CHECK_URL_TIMEOUT": CHECK_URL_TIMEOUT,
+        "COMMON_CONNECTION_TIMEOUT": COMMON_CONNECTION_TIMEOUT,
+        "METRICS_PORT": METRICS_PORT,
+        "HEALTHCHECK_ENABLE": HEALTHCHECK_ENABLE,
+        "HEALTHCHECK_PORT": HEALTHCHECK_PORT,
+        "WEBHOOK_ENABLE": WEBHOOK_ENABLE,
+        "WEBHOOK_APP_URL_ROOT": WEBHOOK_APP_URL_ROOT,
+        "WEBHOOK_APP_URL_PATH": WEBHOOK_APP_URL_PATH,
+        "WEBHOOK_PORT": WEBHOOK_PORT,
+        "COOKIES_FILE": COOKIES_FILE or "",
+        "MAX_ACTIVE_JOBS_PER_CHAT": MAX_ACTIVE_JOBS_PER_CHAT,
+        "MAX_GLOBAL_ACTIVE_JOBS": MAX_GLOBAL_ACTIVE_JOBS,
+    }
+
+
+def validate_runtime_or_raise() -> None:
+    result = validate_runtime_config(get_parsed_runtime_config(), os.environ)
+    for warning in result.warnings:
+        logger.warning("config warning: %s", warning, extra={"event": "config_validation", "status": "warn"})
+    if result.errors:
+        for error in result.errors:
+            logger.error("config error: %s", error, extra={"event": "config_validation", "status": "error"})
+        raise RuntimeError("Invalid runtime configuration. Check startup logs for details.")
+    logger.info("config validation passed", extra={"event": "config_validation", "status": "ok"})
+
+
+def log_startup_summary() -> None:
+    summary = {
+        "mode": _runtime_mode(),
+        "executor_kind": EXECUTOR_KIND,
+        "workers": WORKERS,
+        "dl_dir": DL_DIR,
+        "chat_storage": CHAT_STORAGE,
+        "metrics_enabled": True,
+        "metrics_port": METRICS_PORT,
+        "healthcheck_enabled": HEALTHCHECK_ENABLE,
+        "healthcheck_port": HEALTHCHECK_PORT,
+        "log_mode": "json" if LOG_JSON else "plain",
+        "cross_platform_search": ENABLE_CROSS_PLATFORM_SEARCH,
+        "web_fallback": ENABLE_WEB_FALLBACK,
+        "owner_configured": bool(TG_BOT_OWNER_CHAT_ID),
+    }
+    logger.info(
+        "startup summary: %s",
+        sanitize_mapping_for_log(summary),
+        extra={"event": "startup_summary", "status": "ok"},
+    )
+
+
 def log_startup_mode_and_warnings() -> None:
     mode = _runtime_mode()
     if mode == "webhook":
@@ -3196,9 +3274,12 @@ async def callback_monitor(context: ContextTypes.DEFAULT_TYPE):
 def main():
     global HEALTHCHECK_SERVER
 
+    validate_runtime_or_raise()
+
     # Start exposing Prometheus/OpenMetrics metrics:
     prometheus_client.start_http_server(addr=METRICS_HOST, port=METRICS_PORT, registry=REGISTRY)
     log_startup_mode_and_warnings()
+    log_startup_summary()
     update_runtime_control_metrics()
     run_dl_dir_maintenance("startup")
 
