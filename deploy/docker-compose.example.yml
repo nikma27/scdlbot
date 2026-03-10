@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  scdlbot:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: scdlbot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      BOT_MODE: scdlbot
+      WEBHOOK_ENABLE: "0"   # polling by default in compose example
+      HEALTHCHECK_ENABLE: "1"
+      HEALTHCHECK_HOST: "0.0.0.0"
+      HEALTHCHECK_PORT: "8080"
+      DL_DIR: /var/lib/scdlbot/downloads
+      CHAT_STORAGE: /var/lib/scdlbot/state/scdlbot.pickle
+    volumes:
+      - scdlbot_data:/var/lib/scdlbot
+    ports:
+      - "8080:8080"   # healthcheck endpoint
+      - "8000:8000"   # metrics endpoint
+    command: ["python", "-m", "scdlbot"]
+
+volumes:
+  scdlbot_data:

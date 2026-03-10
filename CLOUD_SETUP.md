@@ -43,6 +43,7 @@ Run all commands from repository root (`/workspace` in Cursor Cloud).
 - Keep `.env.cloud` out of git; commit only `.env.cloud.sample`.
 - Detailed runtime workflow for search/download: `SEARCH_WORKFLOW.md`.
 - Operational runbook for health/restart/admission limits: `OPERATIONS.md`.
+- Docker/systemd deployment examples: `Dockerfile`, `deploy/docker-compose.example.yml`, `deploy/scdlbot.service`.
 - Quality fallback controls for `scdlbot`:
   - `QUALITY_MIN_BITRATE_KBPS` (default `320`)
   - `PREFER_LOSSLESS` (`1` means try to upgrade lossy tracks)

@@ -23,6 +23,10 @@
 4. `make cloud_dry_run`
 5. `make cloud_run`
 
+Для локального smoke-запуска:
+- `make preflight`
+- `make run`
+
 ## 3) Polling vs Webhook
 
 - `WEBHOOK_ENABLE=0` -> polling
@@ -34,6 +38,11 @@
 Для webhook:
 - убедиться, что заполнены `WEBHOOK_APP_URL_ROOT` и корректный `PORT/HOST`
 
+## 3.1) Single-instance правило
+
+- Для одного `TG_BOT_TOKEN` держите только один активный polling-воркер.
+- Для webhook также рекомендуется один активный runtime-инстанс, если не настроена внешняя координация.
+
 ## 4) Healthcheck и metrics
 
 Если `HEALTHCHECK_ENABLE=1`:
@@ -43,6 +52,12 @@
 Prometheus:
 - `METRICS_HOST`, `METRICS_PORT`
 - доступны runtime-метрики по job/admission/shutdown
+
+## 4.1) Логи
+
+- Docker: `docker logs -f scdlbot`
+- systemd: `journalctl -u scdlbot -f`
+- Cloud process manager: используйте встроенный log stream платформы
 
 ## 5) Runtime safety controls
 
@@ -91,3 +106,47 @@ Prometheus:
    - ослабить `*_COOLDOWN_SECONDS` и `BURST_*` с осторожностью
 5. Растёт диск:
    - проверить `DL_DIR`, `TEMP_FILE_TTL_SECONDS`, `DL_DIR_MAX_*`
+
+## 9) Docker deployment (VPS / self-hosted)
+
+Файлы:
+- `Dockerfile` (generic runtime)
+- `deploy/docker-compose.example.yml`
+
+Шаги:
+1. `cp .env.sample .env` и заполнить значения.
+2. `docker compose -f deploy/docker-compose.example.yml up -d --build`
+3. Проверить health: `curl http://127.0.0.1:8080/healthz`
+
+Рекомендации:
+- Пробрасывайте persistent volume для `/var/lib/scdlbot` (там `DL_DIR` и `CHAT_STORAGE`).
+- Не запускайте второй контейнер с тем же токеном в polling-режиме.
+
+## 10) systemd deployment (VPS)
+
+Файл unit:
+- `deploy/scdlbot.service`
+
+Рекомендуемое размещение:
+- Код: `/opt/scdlbot`
+- Environment file: `/etc/scdlbot/scdlbot.env`
+- Persistent storage: `/var/lib/scdlbot/downloads`, `/var/lib/scdlbot/state`
+
+Шаги:
+1. Скопировать unit-файл в `/etc/systemd/system/scdlbot.service`.
+2. Создать env-файл `/etc/scdlbot/scdlbot.env`.
+3. Выполнить:
+   - `sudo systemctl daemon-reload`
+   - `sudo systemctl enable --now scdlbot`
+4. Проверка:
+   - `sudo systemctl status scdlbot`
+   - `journalctl -u scdlbot -f`
+
+## 11) Обновление / restart flow
+
+1. Обновить код (`git pull`).
+2. Обновить зависимости при необходимости (`poetry install --with main,flacbot --sync`).
+3. Прогнать preflight (`poetry run python -m scdlbot.config_validation --preflight`).
+4. Перезапустить сервис:
+   - systemd: `sudo systemctl restart scdlbot`
+   - Docker compose: `docker compose -f deploy/docker-compose.example.yml up -d --build`

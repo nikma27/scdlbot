@@ -80,6 +80,7 @@ Production notes for operators
 - Cloud bootstrap/checklist: ``CLOUD_SETUP.md``
 - Runtime operations runbook: ``OPERATIONS.md``
 - Search/fallback flow details: ``SEARCH_WORKFLOW.md``
+- Docker and systemd examples: ``Dockerfile``, ``deploy/docker-compose.example.yml``, ``deploy/scdlbot.service``
 
 If you run in polling mode, keep exactly one bot instance per token.
 
